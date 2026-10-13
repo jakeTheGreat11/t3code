@@ -25,6 +25,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import type * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-orchestrator-detail");
 const projectId = ProjectId.make("project-mcp-orchestrator-detail");
@@ -39,6 +40,60 @@ const codexDriver = ProviderDriverKind.make("codex");
 // Distinct from driver kind so a regression that re-derives from driver fails.
 const customCodexInstanceId = ProviderInstanceId.make("codex-custom-workspace");
 const parentInstanceId = ProviderInstanceId.make("codex");
+
+it.each([
+  { name: "grouped worker", relationship: { coordinatorThreadId: ThreadId.make("coordinator") } },
+  { name: "ordinary thread", relationship: {} },
+  { name: "undefined coordinator", relationship: { coordinatorThreadId: undefined } },
+  {
+    name: "missing coordinator thread",
+    relationship: { coordinatorThreadId: ThreadId.make("missing") },
+  },
+])("listThread and readThread expose persisted grouping for $name", async ({ relationship }) => {
+  const shell = {
+    ...liveThreadShell(childThreadId, { activeRunId: null }),
+    status: "idle" as const,
+    ...relationship,
+  };
+  const projection = idleThreadProjection(shell);
+  const layer = OrchestratorMcpService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          listProjectThreads: () => Effect.succeed([shell]),
+          getThreadShell: (threadId) => Effect.succeed(threadId === shell.id ? shell : null),
+          getProjectThreadRecords: () => Effect.succeed(projection),
+          getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+        }),
+        ServerSettings.layerTest(),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+        NodeCrypto.layer,
+      ),
+    ),
+  );
+  await Effect.gen(function* () {
+    const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+    const scope = { ...makeScope(), thread: undefined };
+    const list = yield* service.listThreads(scope, { projectId: shell.projectId });
+    const read = yield* service.readThread(scope, { threadId: shell.id });
+    expect(list.threads).toHaveLength(1);
+    expect(list.threads[0]?.coordinatorThreadId).toBe(relationship.coordinatorThreadId);
+    expect(read.thread.coordinatorThreadId).toBe(relationship.coordinatorThreadId);
+    for (const thread of [list.threads[0]!, read.thread]) {
+      expect(thread.parentThreadId).toBeNull();
+      expect(thread.relationshipToParent).toBeNull();
+      if (relationship.coordinatorThreadId === undefined) {
+        expect(thread).not.toHaveProperty("coordinatorThreadId");
+      }
+    }
+  }).pipe(Effect.provide(layer), Effect.runPromise);
+});
 
 const makeScope = (): McpInvocationContext.McpInvocationScope => ({
   environmentId,

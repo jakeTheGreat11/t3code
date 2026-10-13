@@ -43,6 +43,10 @@
       "types": "./src/model.ts",
       "import": "./src/model.ts"
     },
+    "./multiAgentRouting": {
+      "types": "./src/multiAgentRouting.ts",
+      "import": "./src/multiAgentRouting.ts"
+    },
     "./advertisedEndpoint": {
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"

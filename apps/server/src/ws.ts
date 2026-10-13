@@ -1981,6 +1981,9 @@ const layerWsRpc = (
                               ? {}
                               : { messageId: input.initialMessage.messageId }),
                             text: input.initialMessage.text,
+                            ...(input.initialMessage.multiAgent === undefined
+                              ? {}
+                              : { multiAgent: input.initialMessage.multiAgent }),
                             attachments: input.initialMessage.attachments,
                             ...(input.initialMessage.context === undefined
                               ? {}

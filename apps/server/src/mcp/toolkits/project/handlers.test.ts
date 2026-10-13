@@ -67,6 +67,18 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
         launch: (input) => {
+          if (input.title.startsWith("invalid:")) {
+            const reason = input.title.slice("invalid:".length);
+            return Effect.fail(
+              new ThreadLaunch.ThreadLaunchError({
+                operation: "validate-model-selection",
+                commandId: input.commandId,
+                projectId: input.projectId,
+                selectionIssue: { reason },
+                cause: { reason },
+              }),
+            );
+          }
           launched.push(input);
           return Effect.succeed({
             threadId: input.threadId,
@@ -99,6 +111,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
     expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
     expect(launched[0]?.initialMessage?.senderThreadId).toBe(sourceThreadId);
     expect(launched[0]?.coordinatorThreadId).toBeUndefined();
+    expect(launched[0]?.validateExplicitModelSelection).toBe(false);
     for (const groupUnderCaller of [false, true]) {
       yield* toolkit
         .handle("t3_thread_launch", { title: "Worker", groupUnderCaller })
@@ -107,6 +120,30 @@ it.effect("attributes a launched thread's first message to the calling thread", 
     expect(launched[1]?.coordinatorThreadId).toBeUndefined();
     expect(launched[2]?.coordinatorThreadId).toBe(sourceThreadId);
     expect(launched[2]?.initialMessage).toBeUndefined();
+    yield* toolkit
+      .handle("t3_thread_launch", {
+        title: "Explicit worker",
+        modelSelection,
+        groupUnderCaller: true,
+      })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
+    expect(launched[3]?.validateExplicitModelSelection).toBe(true);
+    expect(launched[3]?.modelSelection).toEqual(modelSelection);
+    expect(launched[3]?.coordinatorThreadId).toBe(sourceThreadId);
+    for (const [reason, code] of [
+      ["provider_missing", "provider_unavailable"],
+      ["model_missing", "model_unavailable"],
+      ["invalid_option_value", "invalid_request"],
+    ] as const) {
+      const failure = yield* toolkit
+        .handle("t3_thread_launch", { title: `invalid:${reason}`, modelSelection })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
+      expect(failure.at(-1)?.result).toMatchObject({
+        code,
+        message: expect.stringContaining(reason),
+      });
+    }
+    expect(launched).toHaveLength(4);
   }),
 );
 

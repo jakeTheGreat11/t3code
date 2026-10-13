@@ -261,6 +261,9 @@ import {
 import { useEnvironmentQuery } from "~/state/query";
 import { useDebouncedValue } from "~/state/queries";
 import { ProviderModelPicker } from "./ProviderModelPicker";
+import { MultiAgentControl, MultiAgentPreferencesDialog } from "./MultiAgentControl";
+import { multiAgentControlLabel } from "./MultiAgentControl.logic";
+import { DEFAULT_MULTI_AGENT_CONFIG, type MultiAgentConfig } from "@t3tools/contracts";
 import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
 import {
   type ComposerCommandItem,
@@ -1500,6 +1503,7 @@ export interface ChatComposerHandle {
     selectedPromptEffort: string | null;
     selectedModelOptionsForDispatch: unknown;
     selectedModelSelection: ModelSelection;
+    multiAgent: MultiAgentConfig;
     multipleModelSelections: ReadonlyArray<ModelSelection> | null;
     providerAvailable: boolean;
     selectedProvider: ProviderDriverKind;
@@ -1851,6 +1855,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Store subscriptions (prompt / images / terminal contexts)
   // ------------------------------------------------------------------
   const composerDraft = useComposerThreadDraft(composerDraftTarget);
+  const multiAgentConfig = composerDraft?.multiAgent ?? DEFAULT_MULTI_AGENT_CONFIG;
   // Live target key, for async flows that must notice a thread switch that
   // happened while they awaited.
   const composerDraftTargetKeyRef = useRef("");
@@ -2461,6 +2466,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
+  const [multiAgentDialogTarget, setMultiAgentDialogTarget] = useState<string | null>(null);
+  if (multiAgentDialogTarget !== null && multiAgentDialogTarget !== composerDraftTargetKey) {
+    setMultiAgentDialogTarget(null);
+  }
   const isMobileViewport = useMediaQuery("max-sm");
   const {
     isComposerFocused,
@@ -5474,7 +5483,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const restingProviderTraitsPicker = renderProviderTraitsPicker({
     ...providerTraitsPickerInput,
     size: composerControlsCollapsed ? "xs" : "sm",
-    hidden: composerControlsHidden || restingHiddenBlockCount > 1,
+    hidden: composerControlsHidden || restingHiddenBlockCount > 2,
   });
   const restingBlockDefs = [
     ...(providerTraitsPicker
@@ -5490,6 +5499,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           },
         ]
       : []),
+    {
+      id: "multi-agent",
+      content: (
+        <MultiAgentControl
+          config={multiAgentConfig}
+          size={composerControlsCollapsed ? "xs" : "sm"}
+          onOpen={() => setMultiAgentDialogTarget(composerDraftTargetKey)}
+        />
+      ),
+    },
     {
       id: "mode",
       content: (
@@ -5510,20 +5529,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     .slice(restingBlockDefs.length - restingHiddenBlockCount)
     .map((def) => def.id);
   const composerControls = showProviderUnavailable ? (
-    <ComposerControl
-      type="button"
-      disabled={!providerSetupInstanceId}
-      onClick={() => {
-        if (providerSetupInstanceId) {
-          onOpenProviderSetup(providerSetupInstanceId);
-        }
-      }}
-      data-chat-provider-unavailable="true"
-      className="shrink-0"
-    >
-      <CircleAlertIcon className="size-4" />
-      {providerSetupInstanceId ? "Open provider settings" : "No provider available"}
-    </ComposerControl>
+    <>
+      <ComposerControl
+        type="button"
+        disabled={!providerSetupInstanceId}
+        onClick={() => {
+          if (providerSetupInstanceId) {
+            onOpenProviderSetup(providerSetupInstanceId);
+          }
+        }}
+        data-chat-provider-unavailable="true"
+        className="shrink-0"
+      >
+        <CircleAlertIcon className="size-4" />
+        {providerSetupInstanceId ? "Open provider settings" : "No provider available"}
+      </ComposerControl>
+
+      <MultiAgentControl
+        config={multiAgentConfig}
+        size={composerControlsCollapsed ? "xs" : "sm"}
+        onOpen={() => setMultiAgentDialogTarget(composerDraftTargetKey)}
+      />
+    </>
   ) : (
     <>
       {composerControlsCollapsed &&
@@ -5667,6 +5694,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             traitsMenuContent={
               hiddenRestingBlockIds.includes("traits") ? providerTraitsMenuContent : undefined
             }
+            multiAgentLabel={
+              hiddenRestingBlockIds.includes("multi-agent")
+                ? multiAgentControlLabel(multiAgentConfig)
+                : undefined
+            }
+            onOpenMultiAgentPreferences={() => setMultiAgentDialogTarget(composerDraftTargetKey)}
             onToggleInteractionMode={toggleInteractionMode}
             onRuntimeModeChange={handleRuntimeModeChange}
           />
@@ -6572,6 +6605,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
       },
       getSendContext: () => ({
+        multiAgent: multiAgentConfig,
         answeringPendingUserInput: activePendingProgress !== null,
         prompt: promptRef.current,
         images: composerImagesRef.current,
@@ -6648,6 +6682,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       selectedModel,
       selectedModelOptionsForDispatch,
       selectedModelSelection,
+      multiAgentConfig,
       multipleModelSelections,
       setMultipleModelSelections,
       routeKind,
@@ -7755,6 +7790,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           </div>
         </ComposerSurface.Main>
       </div>
+      <MultiAgentPreferencesDialog
+        target={composerDraftTarget}
+        environmentId={environmentId}
+        open={multiAgentDialogTarget === composerDraftTargetKey}
+        onOpenChange={(open) => setMultiAgentDialogTarget(open ? composerDraftTargetKey : null)}
+        fallbackSelection={selectedModelSelection}
+        instanceEntries={providerInstanceEntries}
+        modelOptionsByInstance={modelOptionsByInstance}
+      />
     </form>
   );
 });

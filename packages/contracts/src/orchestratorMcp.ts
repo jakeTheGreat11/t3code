@@ -319,6 +319,8 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   snoozed: Schema.Boolean,
   /** When a snoozed thread wakes; null when it is not snoozed. */
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  /** Independent worker grouping, separate from fork/subagent lineage. */
+  coordinatorThreadId: Schema.optional(ThreadId),
   parentThreadId: Schema.NullOr(ThreadId),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
   itemCount: NonNegativeInt,
@@ -366,6 +368,8 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   titleRegeneration: Schema.NullOr(ThreadTitleRegeneration),
   branch: Schema.NullOr(Schema.String),
   worktreePath: Schema.NullOr(Schema.String),
+  /** Independent worker grouping, separate from fork/subagent lineage. */
+  coordinatorThreadId: Schema.optional(ThreadId),
   parentThreadId: Schema.NullOr(ThreadId),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
   runCount: NonNegativeInt,

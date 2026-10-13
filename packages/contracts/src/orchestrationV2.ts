@@ -1,4 +1,5 @@
 import { OrchestrationMessageContext } from "./composerContext.ts";
+import { MultiAgentConfig, DEFAULT_MULTI_AGENT_CONFIG } from "./multiAgent.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaAST from "effect/SchemaAST";
@@ -548,6 +549,8 @@ export const OrchestrationV2Run = Schema.Struct({
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
+  /** Immutable preference snapshot at run creation. Legacy runs without it are Off. */
+  multiAgent: Schema.optional(MultiAgentConfig),
   providerThreadId: Schema.NullOr(ProviderThreadId),
   userMessageId: MessageId,
   rootNodeId: Schema.NullOr(NodeId),
@@ -589,6 +592,12 @@ export const OrchestrationV2Run = Schema.Struct({
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
 });
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
+
+export function orchestrationV2RunMultiAgentConfig(
+  run: Pick<OrchestrationV2Run, "multiAgent">,
+): MultiAgentConfig {
+  return run.multiAgent ?? DEFAULT_MULTI_AGENT_CONFIG;
+}
 
 /**
  * When the work a run belongs to started. A wake does not start new work, so
@@ -2933,6 +2942,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
+    multiAgent: Schema.optional(MultiAgentConfig),
     notification: Schema.optional(OrchestrationV2Notification),
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -3299,6 +3309,7 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
   initialMessage: Schema.optional(
     Schema.Struct({
+      multiAgent: Schema.optional(MultiAgentConfig),
       messageId: Schema.optional(MessageId),
       text: Schema.String,
       context: Schema.optional(OrchestrationMessageContext),

@@ -4,6 +4,7 @@ import { EllipsisIcon } from "lucide-react";
 import {
   Menu,
   MenuPopup,
+  MenuItem,
   MenuRadioGroup,
   MenuRadioItem,
   MenuSeparator as MenuDivider,
@@ -22,6 +23,8 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
   }>;
   showInteractionModeToggle: boolean;
   traitsMenuContent?: ReactNode;
+  multiAgentLabel?: string | undefined;
+  onOpenMultiAgentPreferences?: () => void;
   size?: "sm" | "xs";
   /**
    * The resting strip keeps this menu mounted out of flow while every block
@@ -53,6 +56,14 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
         <ComposerControlIcon icon={EllipsisIcon} size={size} />
       </MenuTrigger>
       <MenuPopup align="start" {...composerFloatingLayerProps}>
+        {props.multiAgentLabel && props.onOpenMultiAgentPreferences ? (
+          <>
+            <MenuItem onClick={props.onOpenMultiAgentPreferences}>
+              {props.multiAgentLabel} — execution not enabled
+            </MenuItem>
+            <MenuDivider />
+          </>
+        ) : null}
         {props.traitsMenuContent ? (
           <>
             {props.traitsMenuContent}

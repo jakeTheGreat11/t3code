@@ -236,6 +236,7 @@ export const launchThread = Effect.fn("ThreadMessageIntake.launchThread")(functi
         const notAccepted =
           error.operation === "resolve-project" ||
           error.operation === "read-receipt" ||
+          error.operation === "validate-model-selection" ||
           ((error.operation === "create-thread" || error.operation === "dispatch-message") &&
             (isOrchestratorError(error.cause) || isThreadManagementError(error.cause)) &&
             // Projection errors under create-thread can occur after the message commit.

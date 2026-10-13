@@ -437,6 +437,7 @@ import {
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { snapshotMultiAgentConfig } from "@t3tools/shared/multiAgentRouting";
 import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
 import { isTimelineScrollTarget } from "./chat/timelineScrollTarget";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
@@ -8800,6 +8801,10 @@ export default function ChatView(props: ChatViewProps) {
     },
   ) => {
     e?.preventDefault();
+    const multiAgentForSend = snapshotMultiAgentConfig(
+      composerRef.current?.getSendContext().multiAgent ??
+        useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.multiAgent,
+    );
     // Typed out in full rather than picked from the menu. Attachments or contexts
     // mean the user is sending a prompt, so those go through as usual.
     if (
@@ -9190,6 +9195,7 @@ export default function ChatView(props: ChatViewProps) {
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
       const followUpSent = await onSubmitPlanFollowUp({
+        multiAgent: multiAgentForSend,
         text: followUp.text,
         context: buildMessageContext({
           terminalContexts: sendableComposerTerminalContexts,
@@ -9591,6 +9597,7 @@ export default function ChatView(props: ChatViewProps) {
                 environmentId,
                 input: {
                   threadId: targetThreadId,
+                  multiAgent: multiAgentForSend,
                   message: {
                     messageId: newMessageId(),
                     role: "user",
@@ -9982,6 +9989,7 @@ export default function ChatView(props: ChatViewProps) {
         environmentId,
         input: {
           threadId: threadIdForSend,
+          multiAgent: multiAgentForSend,
           message: {
             messageId: messageIdForSend,
             role: "user",
@@ -10445,11 +10453,16 @@ export default function ChatView(props: ChatViewProps) {
     text,
     context,
     interactionMode: nextInteractionMode,
+    multiAgent,
   }: {
     text: string;
     context?: ReturnType<typeof buildMessageContext>;
     interactionMode: "default" | "plan";
+    multiAgent?: import("@t3tools/contracts").MultiAgentConfig;
   }) {
+    const planMultiAgentForSend = snapshotMultiAgentConfig(
+      multiAgent ?? composerRef.current?.getSendContext().multiAgent,
+    );
     if (
       !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) ||
       !activeThread ||
@@ -10550,6 +10563,7 @@ export default function ChatView(props: ChatViewProps) {
             ...(context ? { context } : {}),
             attachments: [],
           },
+          multiAgent: planMultiAgentForSend,
           modelSelection: ctxSelectedModelSelection,
           titleSeed: activeThread.title,
           runtimeMode,
@@ -10618,6 +10632,7 @@ export default function ChatView(props: ChatViewProps) {
 
     const createdAt = new Date().toISOString();
     const nextThreadId = newThreadId();
+    const multiAgentForNewThread = snapshotMultiAgentConfig(sendCtx.multiAgent);
     const planMarkdown = activeProposedPlan.planMarkdown;
     const implementationPrompt = buildPlanImplementationPrompt(planMarkdown);
     const outgoingImplementationPrompt = formatOutgoingPrompt({
@@ -10665,6 +10680,7 @@ export default function ChatView(props: ChatViewProps) {
             text: outgoingImplementationPrompt,
             attachments: [],
           },
+          multiAgent: multiAgentForNewThread,
           modelSelection: ctxSelectedModelSelection,
           titleSeed: nextThreadTitle,
           runtimeMode: defaultRuntimeMode,

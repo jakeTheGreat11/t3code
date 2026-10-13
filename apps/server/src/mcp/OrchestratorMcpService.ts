@@ -719,6 +719,9 @@ function listItemFromShell(
     linkedPullRequest: shell.linkedPullRequest ?? null,
     ...threadSettlement(shell),
     ...threadSnooze(shell, nowMs),
+    ...(shell.coordinatorThreadId === undefined
+      ? {}
+      : { coordinatorThreadId: shell.coordinatorThreadId }),
     parentThreadId: shell.lineage.parentThreadId,
     relationshipToParent: shell.lineage.relationshipToParent,
     itemCount: shell.visibleItemCount,
@@ -759,6 +762,9 @@ function threadDetail(
           },
     branch: projection.thread.branch,
     worktreePath: projection.thread.worktreePath,
+    ...(projection.thread.coordinatorThreadId === undefined
+      ? {}
+      : { coordinatorThreadId: projection.thread.coordinatorThreadId }),
     parentThreadId: projection.thread.lineage.parentThreadId,
     relationshipToParent: projection.thread.lineage.relationshipToParent,
     runCount: projection.runs.length,

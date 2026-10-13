@@ -3,6 +3,7 @@ import type {
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
 } from "@t3tools/contracts";
+import { snapshotMultiAgentConfig } from "@t3tools/shared/multiAgentRouting";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -5025,6 +5026,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ),
               );
         const run: OrchestrationV2Run = {
+          multiAgent: snapshotMultiAgentConfig(command.multiAgent),
           id: runId,
           threadId: command.threadId,
           ordinal,
@@ -5377,6 +5379,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   mapDispatchError(command),
                 );
         const run: OrchestrationV2Run = {
+          multiAgent: snapshotMultiAgentConfig(command.multiAgent),
           id: runId,
           threadId: command.threadId,
           ordinal,
@@ -6069,6 +6072,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         );
       const run: OrchestrationV2Run = {
+        multiAgent: snapshotMultiAgentConfig(command.multiAgent),
         id: runId,
         threadId: command.threadId,
         ordinal,

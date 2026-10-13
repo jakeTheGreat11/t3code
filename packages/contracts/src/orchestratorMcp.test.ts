@@ -7,7 +7,9 @@ import {
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadListInput,
+  OrchestratorMcpThreadListResult,
   OrchestratorMcpThreadReadInput,
+  OrchestratorMcpThreadReadResult,
   OrchestratorMcpThreadSendInput,
   OrchestratorMcpThreadWaitInput,
 } from "./orchestratorMcp.ts";
@@ -20,8 +22,82 @@ const decodeThreadListInput = Schema.decodeUnknownSync(OrchestratorMcpThreadList
 const decodeThreadReadInput = Schema.decodeUnknownSync(OrchestratorMcpThreadReadInput);
 const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSendInput);
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
+const decodeThreadListResult = Schema.decodeUnknownSync(OrchestratorMcpThreadListResult);
+const encodeThreadListResult = Schema.encodeSync(OrchestratorMcpThreadListResult);
+const decodeThreadReadResult = Schema.decodeUnknownSync(OrchestratorMcpThreadReadResult);
+const encodeThreadReadResult = Schema.encodeSync(OrchestratorMcpThreadReadResult);
+
+const discoveryThread = {
+  threadId: "worker",
+  projectId: "project",
+  title: "Worker",
+  createdBy: "agent",
+  creationSource: "mcp",
+  status: "idle",
+  latestRunId: null,
+  activeRunId: null,
+  providerInstanceId: "codex",
+  model: "gpt-5",
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  linkedPullRequest: null,
+  titleRegeneration: null,
+  branch: null,
+  worktreePath: null,
+  parentThreadId: null,
+  relationshipToParent: null,
+  runCount: 0,
+  itemCount: 0,
+  pendingRequestCount: 0,
+  archived: false,
+  settled: false,
+  settledAt: null,
+  snoozed: false,
+  snoozedUntil: null,
+  createdAt: "2026-10-01T00:00:00.000Z",
+  updatedAt: "2026-10-01T00:00:00.000Z",
+};
 
 describe("orchestrator MCP contracts", () => {
+  it.each([
+    { name: "grouped worker", relationship: { coordinatorThreadId: "coordinator" } },
+    { name: "legacy ordinary thread", relationship: {} },
+    { name: "explicitly undefined coordinator", relationship: { coordinatorThreadId: undefined } },
+    { name: "unavailable coordinator", relationship: { coordinatorThreadId: "missing-thread" } },
+  ])("round-trips discovery responses for $name", ({ relationship }) => {
+    const thread = { ...discoveryThread, ...relationship };
+    const list = decodeThreadListResult({
+      projectId: "project",
+      currentThreadId: null,
+      threads: [thread],
+      nextCursor: null,
+      total: 1,
+    });
+    const read = decodeThreadReadResult({
+      thread,
+      recentRuns: [],
+      items: [],
+      nextPosition: null,
+      hasMore: false,
+    });
+    const listWire = encodeThreadListResult(list);
+    const readWire = encodeThreadReadResult(read);
+    expect(decodeThreadListResult(listWire).threads[0]?.coordinatorThreadId).toBe(
+      relationship.coordinatorThreadId,
+    );
+    expect(decodeThreadReadResult(readWire).thread.coordinatorThreadId).toBe(
+      relationship.coordinatorThreadId,
+    );
+    expect(read.thread.parentThreadId).toBeNull();
+    expect(read.thread.relationshipToParent).toBeNull();
+    if (relationship.coordinatorThreadId === undefined) {
+      expect(JSON.parse(JSON.stringify(listWire)).threads[0]).not.toHaveProperty(
+        "coordinatorThreadId",
+      );
+      expect(JSON.parse(JSON.stringify(readWire)).thread).not.toHaveProperty("coordinatorThreadId");
+    }
+  });
+
   it("decodes cross-provider delegated task requests and durable results", () => {
     const request = decodeDelegateTaskInput({
       task: "Inspect the workspace and report the result.",

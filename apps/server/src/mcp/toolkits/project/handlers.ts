@@ -149,6 +149,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           projectId,
           title: input.title,
           modelSelection,
+          validateExplicitModelSelection: input.modelSelection !== undefined,
           runtimeMode,
           interactionMode,
           workspaceStrategy: input.workspaceStrategy ?? { type: "root" },
@@ -166,6 +167,17 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           creationSource: "mcp",
         }).pipe(
           Effect.mapError((error) => {
+            if (error._tag === "ThreadLaunchError" && error.selectionIssue !== undefined) {
+              const reason = error.selectionIssue.reason;
+              return new OrchestratorMcpFailure({
+                code: reason.startsWith("provider_")
+                  ? "provider_unavailable"
+                  : reason.startsWith("model_")
+                    ? "model_unavailable"
+                    : "invalid_request",
+                message: error.message,
+              });
+            }
             if (error._tag === "AttachmentClaimError") {
               return new OrchestratorMcpFailure({
                 code: "orchestration_error",

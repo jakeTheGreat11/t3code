@@ -15,6 +15,7 @@ import {
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   ThreadId,
   type ModelSelection,
+  type MultiAgentConfig,
   type PreviewAnnotationPayload,
   type ProviderOptionSelection,
 } from "@t3tools/contracts";
@@ -3564,6 +3565,197 @@ describe("composerDraftStore attachment references", () => {
     );
     expect(merged.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.prompt).toBe(
       prompt,
+    );
+  });
+});
+
+describe("composerDraftStore Multi-Agent preferences", () => {
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("routing-preferences"));
+  const remoteRef = scopeThreadRef(OTHER_TEST_ENVIRONMENT_ID, threadRef.threadId);
+  const custom: MultiAgentConfig = {
+    mode: "custom",
+    roles: {
+      planner: {
+        instanceId: ProviderInstanceId.make("configured-instance"),
+        model: "planner-model",
+      },
+      worker: {
+        instanceId: ProviderInstanceId.make("another-instance"),
+        model: "worker-model",
+        options: [{ id: "provider-option", value: "choice" }],
+      },
+      rescuer: {
+        instanceId: ProviderInstanceId.make("configured-instance"),
+        model: "rescue-model",
+      },
+      reviewer: { instanceId: ProviderInstanceId.make("another-instance"), model: "review-model" },
+    },
+  };
+
+  beforeEach(resetComposerDraftStore);
+  afterEach(resetComposerDraftStore);
+
+  it("defaults missing preferences to off without creating or persisting a draft", () => {
+    const store = useComposerDraftStore.getState();
+    expect(store.getMultiAgentConfig(threadRef)).toEqual({ mode: "off" });
+    store.setMultiAgentConfig(threadRef, { mode: "off" });
+    expect(store.getComposerDraft(threadRef)).toBeNull();
+    expect(
+      partializeComposerDraftStoreState(useComposerDraftStore.getState()).draftsByThreadKey,
+    ).toEqual({});
+  });
+
+  it.each([
+    { mode: "auto", preset: "budget" },
+    { mode: "auto", preset: "balanced" },
+    { mode: "auto", preset: "maximum" },
+    custom,
+  ] satisfies MultiAgentConfig[])(
+    "persists and rehydrates preference-only drafts: %j",
+    async (config) => {
+      vi.useFakeTimers();
+      try {
+        await useComposerDraftStore.persist.clearStorage();
+        useComposerDraftStore.getState().setMultiAgentConfig(threadRef, config);
+        expect(
+          composerDraftHasUserContent(useComposerDraftStore.getState().getComposerDraft(threadRef)),
+        ).toBe(false);
+        await vi.advanceTimersByTimeAsync(300);
+        resetComposerDraftStore();
+        await useComposerDraftStore.persist.rehydrate();
+        expect(useComposerDraftStore.getState().getMultiAgentConfig(threadRef)).toEqual(config);
+        expect(
+          partializeComposerDraftStoreState(useComposerDraftStore.getState()).draftsByThreadKey[
+            scopedThreadKey(threadRef)
+          ]?.multiAgent,
+        ).toEqual(config);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("scopes preferences to the composer target rather than a global sticky selection", () => {
+    const store = useComposerDraftStore.getState();
+    store.setMultiAgentConfig(threadRef, custom);
+    expect(store.getMultiAgentConfig(threadRef)).toEqual(custom);
+    expect(store.getMultiAgentConfig(remoteRef)).toEqual({ mode: "off" });
+    expect(
+      store.getMultiAgentConfig(
+        scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("another-thread")),
+      ),
+    ).toEqual({ mode: "off" });
+  });
+
+  it("preserves the preference when composer content is cleared and removes it on off", () => {
+    const store = useComposerDraftStore.getState();
+    store.setMultiAgentConfig(threadRef, custom);
+    store.setPrompt(threadRef, "A task");
+    store.clearComposerContent(threadRef);
+    expect(store.getMultiAgentConfig(threadRef)).toEqual(custom);
+    store.setMultiAgentConfig(threadRef, { mode: "off" });
+    expect(store.getMultiAgentConfig(threadRef)).toEqual({ mode: "off" });
+    expect(store.getComposerDraft(threadRef)).toBeNull();
+  });
+
+  it("clears a preference without altering text or the ordinary model selection", () => {
+    const store = useComposerDraftStore.getState();
+    const selection = {
+      instanceId: ProviderInstanceId.make("configured-instance"),
+      model: "ordinary-model",
+    };
+    store.setPrompt(threadRef, "Keep this task");
+    store.setModelSelection(threadRef, selection);
+    store.setMultiAgentConfig(threadRef, custom);
+    store.setMultiAgentConfig(threadRef, undefined);
+    expect(store.getMultiAgentConfig(threadRef)).toEqual({ mode: "off" });
+    expect(store.getComposerDraft(threadRef)?.prompt).toBe("Keep this task");
+    expect(
+      store.getComposerDraft(threadRef)?.modelSelectionByProvider[selection.instanceId],
+    ).toEqual(selection);
+  });
+
+  it("rehydrates draft-session preferences without a prompt, including through legacy migration", async () => {
+    const store = useComposerDraftStore.getState();
+    const draftId = DraftId.make("routing-draft-session");
+    store.setProjectDraftThreadId(
+      scopeProjectRef(TEST_ENVIRONMENT_ID, ProjectId.make("routing-project")),
+      draftId,
+    );
+    store.setMultiAgentConfig(draftId, { mode: "auto", preset: "balanced" });
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    const options = useComposerDraftStore.persist.getOptions();
+    const migrated = await options.migrate!(persisted, 8);
+    const hydrated = options.merge!(migrated, useComposerDraftStore.getState());
+    useComposerDraftStore.setState(hydrated);
+    expect(useComposerDraftStore.getState().getMultiAgentConfig(draftId)).toEqual({
+      mode: "auto",
+      preset: "balanced",
+    });
+    expect(useComposerDraftStore.getState().getMultiAgentConfig(threadRef)).toEqual({
+      mode: "off",
+    });
+  });
+
+  it.each([
+    undefined,
+    null,
+    "auto",
+    true,
+    {},
+    { mode: "unknown" },
+    { mode: "auto" },
+    { mode: "auto", preset: "unknown" },
+    { mode: "custom", roles: { worker: { model: "missing-instance" } } },
+  ])("defaults malformed or missing persisted preferences to off: %j", (multiAgent) => {
+    const options = useComposerDraftStore.persist.getOptions();
+    const hydrated = options.merge!(
+      {
+        draftsByThreadKey: {
+          [scopedThreadKey(threadRef)]: {
+            prompt: "Keep draft content",
+            attachments: [],
+            multiAgent,
+          },
+        },
+        draftThreadsByThreadKey: {},
+        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      },
+      useComposerDraftStore.getState(),
+    );
+    useComposerDraftStore.setState(hydrated);
+    expect(useComposerDraftStore.getState().getMultiAgentConfig(threadRef)).toEqual({
+      mode: "off",
+    });
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "Keep draft content",
+    );
+    expect(
+      partializeComposerDraftStoreState(useComposerDraftStore.getState()).draftsByThreadKey[
+        scopedThreadKey(threadRef)
+      ],
+    ).not.toHaveProperty("multiAgent");
+  });
+
+  it("defaults historical composer payloads to off and preserves existing preferences", async () => {
+    const options = useComposerDraftStore.persist.getOptions();
+    const legacy = {
+      draftsByThreadId: {
+        [scopedThreadKey(threadRef)]: {
+          prompt: "Legacy task",
+          attachments: [],
+          provider: "configured-instance",
+          model: "legacy-model",
+        },
+      },
+    };
+    const migrated = await options.migrate!(legacy, 2);
+    useComposerDraftStore.setState(options.merge!(migrated, useComposerDraftStore.getState()));
+    expect(useComposerDraftStore.getState().getMultiAgentConfig(threadRef)).toEqual({
+      mode: "off",
+    });
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "Legacy task",
     );
   });
 });

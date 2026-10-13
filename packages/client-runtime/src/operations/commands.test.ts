@@ -20,6 +20,7 @@ import {
   type OrchestrationV2ThreadLaunchInput,
   type OrchestrationV2ThreadProjection,
   type ProjectMutation,
+  type MultiAgentConfig,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
@@ -63,6 +64,85 @@ const layerTestCrypto = Layer.succeed(
     randomBytes: (size) => new Uint8Array(size),
     digest: (_algorithm, data) => Effect.succeed(data),
   }),
+);
+
+it.effect.each(["auto", "start", "queue", "steer", "restart"] as const)(
+  "transmits a detached Multi-Agent snapshot on %s dispatch",
+  (dispatchMode) =>
+    Effect.gen(function* () {
+      const commands: OrchestrationV2Command[] = [];
+      const supervisor = yield* makeSupervisor({ commands, projects: [] });
+      const multiAgent = {
+        mode: "custom" as const,
+        roles: {
+          worker: {
+            instanceId: ProviderInstanceId.make("configured-worker"),
+            model: "catalog-model",
+            options: [{ id: "catalog-option", value: "catalog-value" }],
+          },
+        },
+      };
+      const expected = structuredClone(multiAgent);
+      yield* startThreadTurn({
+        threadId: v2ThreadId,
+        message: {
+          messageId: MessageId.make("multi-agent"),
+          role: "user",
+          text: "Work",
+          attachments: [],
+        },
+        ...(multiAgent === undefined ? {} : { multiAgent }),
+        dispatchMode,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+      multiAgent.roles.worker.options[0]!.value = "changed-after-send";
+      expect(commands[0]).toMatchObject({ type: "message.dispatch", multiAgent: expected });
+    }).pipe(Effect.provide(layerTestCrypto)),
+);
+
+it.effect.each([
+  undefined,
+  { mode: "off" },
+  { mode: "auto", preset: "budget" },
+  { mode: "auto", preset: "balanced" },
+  { mode: "auto", preset: "maximum" },
+  { mode: "custom", roles: {} },
+] satisfies Array<MultiAgentConfig | undefined>)(
+  "transmits first-message preferences through bootstrap: %j",
+  (multiAgent) =>
+    Effect.gen(function* () {
+      const launches: OrchestrationV2ThreadLaunchInput[] = [];
+      const supervisor = yield* makeSupervisor({ commands: [], projects: [], launches });
+      yield* startThreadTurn({
+        threadId: v2ThreadId,
+        message: {
+          messageId: MessageId.make("multi-agent-bootstrap"),
+          role: "user",
+          text: "Work",
+          attachments: [],
+        },
+        ...(multiAgent === undefined ? {} : { multiAgent }),
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        bootstrap: {
+          createThread: {
+            projectId: ProjectId.make("project-1"),
+            title: "Thread",
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdAt: "2026-10-01T00:00:00Z",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("configured-instance"),
+              model: "catalog-model",
+            },
+            branch: null,
+            worktreePath: null,
+          },
+        },
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+      expect(launches[0]?.initialMessage?.multiAgent).toEqual(multiAgent);
+    }).pipe(Effect.provide(layerTestCrypto)),
 );
 
 const TARGET = new PrimaryConnectionTarget({

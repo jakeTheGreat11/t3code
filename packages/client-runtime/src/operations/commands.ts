@@ -167,6 +167,7 @@ interface StartThreadBootstrap {
 }
 
 export interface StartThreadTurnInput extends ThreadCommandInput {
+  readonly multiAgent?: import("@t3tools/contracts").MultiAgentConfig;
   readonly manualContinuationOfRunId?: RunId;
   readonly message: {
     readonly messageId: MessageId;
@@ -631,6 +632,7 @@ export const setThreadInteractionMode = Effect.fn("EnvironmentCommands.setThread
 export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(function* (
   input: StartThreadTurnInput,
 ) {
+  const multiAgent = input.multiAgent === undefined ? undefined : structuredClone(input.multiAgent);
   const commandId = yield* allocateCommandId(input);
   const attachments = yield* persistAttachments(
     input.threadId,
@@ -683,6 +685,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
       interactionMode: input.interactionMode,
       workspaceStrategy,
       initialMessage: {
+        ...(multiAgent === undefined ? {} : { multiAgent }),
         messageId: input.message.messageId,
         text: input.message.text,
         ...(context ? { context } : {}),
@@ -695,6 +698,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
   if (requestedMode === "start") {
     return yield* dispatch({
       type: "message.dispatch",
+      ...(multiAgent === undefined ? {} : { multiAgent }),
       commandId,
       createdBy: "user",
       creationSource: input.creationSource ?? "web",
@@ -759,6 +763,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
     (serverResolvesCommandContext || projection?.messages.length === 0);
   return yield* dispatch({
     type: "message.dispatch",
+    ...(multiAgent === undefined ? {} : { multiAgent }),
     commandId,
     createdBy: "user",
     creationSource: input.creationSource ?? "web",

@@ -24,6 +24,8 @@ import {
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
   type ServerProvider,
+  type MultiAgentConfig,
+  orchestrationV2RunMultiAgentConfig,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -70,6 +72,37 @@ const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.1-codex",
 } as const;
+const launchCatalogProvider: ServerProvider = {
+  instanceId: modelSelection.instanceId,
+  driver: ProviderDriverKind.make("codex"),
+  enabled: true,
+  installed: true,
+  status: "ready",
+  version: null,
+  auth: { status: "authenticated" },
+  checkedAt: "2026-06-20T00:00:00.000Z",
+  slashCommands: [],
+  skills: [],
+  models: [
+    {
+      slug: modelSelection.model,
+      name: "Launch test model",
+      aliases: ["launch-model-alias"],
+      isCustom: false,
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "effort",
+            label: "Effort",
+            type: "select",
+            options: [{ id: "supported", label: "Supported" }],
+          },
+          { id: "feature", label: "Feature", type: "boolean" },
+        ],
+      },
+    },
+  ],
+};
 const project = {
   id: projectId,
   title: "Project",
@@ -254,6 +287,163 @@ function makeHarness(options: HarnessOptions = {}) {
   };
 }
 
+it.effect.each([false, true])(
+  "validates explicit selections without changing grouping (%s)",
+  (grouped) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const coordinator = yield* launches.launch(
+        launchInput({ command: "explicit:coordinator", thread: "explicit:coordinator" }),
+      );
+      const options = [
+        { id: "effort", value: "supported" },
+        { id: "feature", value: false },
+      ];
+      const input = {
+        ...launchInput({ command: "explicit:worker", thread: "explicit:worker" }),
+        modelSelection: { ...modelSelection, model: "launch-model-alias", options },
+        validateExplicitModelSelection: true,
+        ...(grouped ? { coordinatorThreadId: coordinator.threadId } : {}),
+      };
+      const launched = yield* launches.launch(input);
+      assert.deepEqual(launched.projection.thread.modelSelection, { ...modelSelection, options });
+      assert.equal(
+        launched.projection.thread.coordinatorThreadId,
+        grouped ? coordinator.threadId : undefined,
+      );
+      assert.isNull(launched.projection.thread.lineage.parentThreadId);
+      const replay = yield* launches.launch({
+        ...input,
+        modelSelection: { ...modelSelection, model: "no-longer-advertised" },
+      });
+      assert.equal(replay.threadId, launched.threadId);
+      assert.deepEqual(
+        replay.projection.thread.modelSelection,
+        launched.projection.thread.modelSelection,
+      );
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each([
+  {
+    selection: { ...modelSelection, model: "missing" },
+    providers: [launchCatalogProvider],
+    reason: "model_missing",
+  },
+  { selection: modelSelection, providers: [], reason: "provider_missing" },
+  {
+    selection: { ...modelSelection, instanceId: ProviderInstanceId.make("foreign-instance") },
+    providers: [launchCatalogProvider],
+    reason: "provider_missing",
+  },
+  {
+    selection: modelSelection,
+    providers: [
+      {
+        ...launchCatalogProvider,
+        instanceId: ProviderInstanceId.make("same-driver-other-instance"),
+      },
+    ],
+    reason: "provider_missing",
+  },
+  {
+    selection: modelSelection,
+    providers: [{ ...launchCatalogProvider, availability: "unavailable" as const }],
+    reason: "provider_unavailable",
+  },
+  {
+    selection: modelSelection,
+    providers: [{ ...launchCatalogProvider, installed: false }],
+    reason: "provider_not_installed",
+  },
+  {
+    selection: { ...modelSelection, options: [{ id: "effort", value: "unsupported" }] },
+    providers: [launchCatalogProvider],
+    reason: "invalid_option_value",
+    optionId: "effort",
+  },
+  {
+    selection: { ...modelSelection, options: [{ id: "feature", value: "true" }] },
+    providers: [launchCatalogProvider],
+    reason: "invalid_option_value",
+    optionId: "feature",
+  },
+  {
+    selection: { ...modelSelection, options: [{ id: "unknown", value: false }] },
+    providers: [launchCatalogProvider],
+    reason: "unknown_option",
+    optionId: "unknown",
+  },
+  {
+    selection: {
+      ...modelSelection,
+      options: [
+        { id: "feature", value: false },
+        { id: "feature", value: true },
+      ],
+    },
+    providers: [launchCatalogProvider],
+    reason: "duplicate_option",
+    optionId: "feature",
+  },
+  {
+    selection: { ...modelSelection, options: [{ id: "effort", value: "supported" }] },
+    providers: [
+      {
+        ...launchCatalogProvider,
+        models: launchCatalogProvider.models.map((model) => ({ ...model, capabilities: null })),
+      },
+    ],
+    reason: "option_metadata_missing",
+  },
+])("refuses explicit selections before creating a thread: $reason", (testCase) => {
+  const harness = makeHarness({ providers: testCase.providers });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const input = {
+      ...launchInput({ command: "explicit:invalid", thread: "explicit:invalid" }),
+      modelSelection: testCase.selection,
+      validateExplicitModelSelection: true,
+    };
+    const error = yield* launches.launch(input).pipe(Effect.flip);
+    if (error._tag !== "ThreadLaunchError") return assert.fail(`Unexpected error: ${error._tag}`);
+    assert.equal(error.operation, "validate-model-selection");
+    assert.deepEqual(error.selectionIssue, {
+      reason: testCase.reason,
+      ...("optionId" in testCase ? { optionId: testCase.optionId } : {}),
+    });
+    assert.isNull(yield* threads.getThreadShell(input.threadId));
+    assert.isFalse(harness.createWorktree.mock.calls.length > 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "leaves inherited and ordinary launch selections unchanged without catalog validation",
+  () => {
+    const harness = makeHarness({ providers: [] });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      for (const validateExplicitModelSelection of [undefined, false]) {
+        const input = {
+          ...launchInput({
+            command: `inherit:${validateExplicitModelSelection}`,
+            thread: `inherit:${validateExplicitModelSelection}`,
+          }),
+          ...(validateExplicitModelSelection === undefined
+            ? {}
+            : { validateExplicitModelSelection }),
+        };
+        const launched = yield* launches.launch(input);
+        assert.deepEqual(launched.projection.thread.modelSelection, modelSelection);
+        assert.isUndefined(launched.projection.thread.coordinatorThreadId);
+      }
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
 function launchInput(input: {
   readonly command: string;
   readonly thread: string;
@@ -282,6 +472,108 @@ function launchInput(input: {
     creationSource: "web" as const,
   };
 }
+
+it.effect.each([
+  { name: "legacy", config: undefined },
+  { name: "off", config: { mode: "off" } },
+  { name: "budget", config: { mode: "auto", preset: "budget" } },
+  { name: "balanced", config: { mode: "auto", preset: "balanced" } },
+  { name: "maximum", config: { mode: "auto", preset: "maximum" } },
+  {
+    name: "custom",
+    config: {
+      mode: "custom",
+      roles: {
+        worker: {
+          instanceId: ProviderInstanceId.make("configured-worker"),
+          model: "catalog-model",
+          options: [
+            { id: "catalog-option", value: "catalog-value" },
+            { id: "catalog-boolean", value: false },
+          ],
+        },
+      },
+    },
+  },
+] satisfies Array<{ name: string; config: MultiAgentConfig | undefined }>)(
+  "snapshots $name preferences through launch, queue, reload, and event replay",
+  (testCase) => {
+    const harness = makeHarness({ runSetup: () => Effect.never });
+    const layerFiles = ServerConfig.layerTest(process.cwd(), { prefix: "t3-run-policy-" }).pipe(
+      Layer.provideMerge(NodeServices.layer),
+    );
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const config = structuredClone(testCase.config);
+      const expected = structuredClone(config ?? { mode: "off" });
+      const launched = yield* launches.launch({
+        ...launchInput({ command: "policy:first", thread: "policy:thread", message: "First" }),
+        initialMessage: {
+          messageId: MessageId.make("policy:first"),
+          text: "First",
+          attachments: [],
+          ...(config === undefined ? {} : { multiAgent: config }),
+        },
+      });
+      const firstRun = launched.projection.runs[0]!;
+      assert.include(["preparing", "starting", "running"], firstRun.status);
+      assert.deepEqual(firstRun.multiAgent, expected);
+      // Preferences can be changed while the first run is active, but only the next run sees them.
+      if (config?.mode === "custom" && config.roles.worker)
+        config.roles.worker.options![0]!.value = "later-value";
+      const nextPolicy: MultiAgentConfig =
+        expected.mode === "off" ? { mode: "auto", preset: "maximum" } : { mode: "off" };
+      const command = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("policy:next"),
+        threadId: launched.threadId,
+        messageId: MessageId.make("policy:next"),
+        text: "Next",
+        attachments: [],
+        multiAgent: nextPolicy,
+        dispatchMode: { type: "queue_after_active" as const },
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+      };
+      yield* ThreadMessageIntake.dispatchCommand(command);
+      yield* ThreadMessageIntake.dispatchCommand({
+        ...command,
+        multiAgent: { mode: "custom", roles: {} },
+      });
+      const reloaded = yield* threads.getThreadProjection(launched.threadId);
+      assert.lengthOf(reloaded.runs, 2);
+      assert.deepEqual(reloaded.runs[0]?.multiAgent, expected);
+      assert.deepEqual(reloaded.runs[1]?.multiAgent, nextPolicy);
+      const eventStore = yield* EventStore.EventStoreV2.pipe(Effect.provide(EventStore.layer));
+      const events = yield* eventStore
+        .read({ threadId: launched.threadId })
+        .pipe(Stream.runCollect);
+      for (const layer of [ProjectionStore.layerMemory, ProjectionStore.layer]) {
+        yield* Effect.gen(function* () {
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          if (layer === ProjectionStore.layerMemory)
+            for (const stored of events) yield* projections.apply(stored.event);
+          const restored = yield* projections.getThreadProjection(launched.threadId);
+          assert.deepEqual(restored.runs[0]?.multiAgent, expected);
+          assert.deepEqual(restored.runs[1]?.multiAgent, nextPolicy);
+          // Legacy updates and even conflicting lifecycle snapshots cannot replace the policy.
+          const created = events.find((stored) => stored.event.type === "run.created");
+          assert.ok(created?.event.type === "run.created");
+          const { multiAgent: _multiAgent, ...legacyRun } = created.event.payload;
+          for (const payload of [legacyRun, { ...legacyRun, multiAgent: nextPolicy }]) {
+            yield* projections.apply({ ...created.event, type: "run.updated", payload });
+            assert.deepEqual(
+              (yield* projections.getThreadProjection(launched.threadId)).runs[0]?.multiAgent,
+              expected,
+            );
+          }
+        }).pipe(Effect.provide(layer));
+      }
+      assert.deepEqual(orchestrationV2RunMultiAgentConfig({}), { mode: "off" });
+    }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+  },
+);
 
 function waitUntil<E, R>(predicate: () => Effect.Effect<boolean, E, R>): Effect.Effect<void, E, R> {
   return Effect.gen(function* () {
@@ -2308,6 +2600,22 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
     }).pipe(Effect.flip);
     assert.equal(missingProject._tag, "ThreadLaunchError");
     assert.equal((yield* claimedFiles).length, 1);
+    const invalidSelection = yield* ThreadMessageIntake.launchThread({
+      ...input,
+      commandId: CommandId.make("intake-invalid-selection"),
+      threadId: ThreadId.make("intake-invalid-selection"),
+      modelSelection: {
+        ...modelSelection,
+        instanceId: ProviderInstanceId.make("foreign-instance"),
+      },
+      validateExplicitModelSelection: true,
+    }).pipe(Effect.flip);
+    assert.equal(invalidSelection._tag, "ThreadLaunchError");
+    if (invalidSelection._tag === "ThreadLaunchError") {
+      assert.equal(invalidSelection.operation, "validate-model-selection");
+    }
+    assert.equal((yield* claimedFiles).length, 1);
+    assert.isNull(yield* threads.getThreadShell(ThreadId.make("intake-invalid-selection")));
     const missingThread = yield* ThreadMessageIntake.dispatchCommand({
       type: "message.dispatch",
       commandId: CommandId.make("intake-no-thread"),

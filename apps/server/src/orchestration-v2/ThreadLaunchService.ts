@@ -2,11 +2,13 @@ import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { validateModelSelection } from "@t3tools/shared/multiAgentRouting";
 import {
   CommandId,
   type ChatAttachment,
   type MessageId,
   type ModelSelection,
+  type MultiAgentConfig,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
   type OrchestrationV2ProviderThreadNativeMetadata,
@@ -64,6 +66,7 @@ export type ThreadLaunchWorkspaceStrategy =
     };
 
 export interface ThreadLaunchInitialMessage {
+  readonly multiAgent?: MultiAgentConfig;
   readonly messageId?: MessageId;
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly senderThreadId?: ThreadId;
@@ -81,6 +84,8 @@ export interface ThreadLaunchInput {
   readonly title: string;
   readonly generateTitle?: boolean;
   readonly modelSelection: ModelSelection;
+  /** Explicit MCP selections are checked against this environment's catalog; inherited selections retain legacy behavior. */
+  readonly validateExplicitModelSelection?: boolean;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
   readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
@@ -128,6 +133,7 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
     operation: Schema.Literals([
       "resolve-project",
       "read-receipt",
+      "validate-model-selection",
       "generate-metadata",
       "provision-worktree",
       "run-setup-script",
@@ -140,10 +146,19 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
     commandId: CommandId,
     projectId: ProjectId,
     threadId: Schema.optional(ThreadId),
+    selectionIssue: Schema.optional(
+      Schema.Struct({
+        reason: Schema.String,
+        optionId: Schema.optional(Schema.String),
+      }),
+    ),
     cause: Schema.Defect(),
   },
 ) {
   override get message(): string {
+    if (this.selectionIssue !== undefined) {
+      return `Explicit launch model selection is invalid or unavailable: ${this.selectionIssue.reason}${this.selectionIssue.optionId === undefined ? "" : ` (${this.selectionIssue.optionId})`}. No thread was created.`;
+    }
     return `Thread launch ${this.commandId} failed during ${this.operation}.`;
   }
 }
@@ -773,6 +788,22 @@ const make = Effect.gen(function* () {
       }
 
       const launchReceipt = yield* readReceipt(input, input.commandId);
+      if (input.validateExplicitModelSelection === true && Option.isNone(launchReceipt)) {
+        const validated = validateModelSelection(input.modelSelection, {
+          providers: yield* providerRegistry.getProviders,
+        });
+        if ("issue" in validated) {
+          return yield* new ThreadLaunchError({
+            operation: "validate-model-selection",
+            commandId: input.commandId,
+            projectId: input.projectId,
+            ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+            selectionIssue: validated.issue,
+            cause: validated.issue,
+          });
+        }
+        input = { ...input, modelSelection: validated.modelSelection };
+      }
       yield* threads.assertProviderInstanceEnabled({
         projectId: input.projectId,
         commandId: input.commandId,
@@ -900,6 +931,9 @@ const make = Effect.gen(function* () {
               threadId,
               messageId,
               text: input.initialMessage.text,
+              ...(input.initialMessage.multiAgent === undefined
+                ? {}
+                : { multiAgent: input.initialMessage.multiAgent }),
               ...(input.initialMessage.scheduledTaskId === undefined
                 ? {}
                 : { scheduledTaskId: input.initialMessage.scheduledTaskId }),

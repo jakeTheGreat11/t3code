@@ -7,6 +7,8 @@ import {
   defaultInstanceIdForDriver,
   EnvironmentId,
   ModelSelection,
+  MultiAgentConfig,
+  DEFAULT_MULTI_AGENT_CONFIG,
   ProjectId,
   ProviderInstanceId,
   ProviderInteractionMode,
@@ -36,6 +38,7 @@ import {
 import * as Schema from "effect/Schema";
 import * as Equal from "effect/Equal";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import { DeepMutable } from "effect/Types";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import { useMemo } from "react";
@@ -86,6 +89,13 @@ const isReviewCommentContext = Schema.is(ReviewCommentContextSchema);
 const isThreadContextRecord = Schema.is(ThreadContextRecord);
 const isSnapShotSource = Schema.is(SnapShotSource);
 const isPreviewAnnotationPayload = Schema.is(PreviewAnnotationPayloadSchema);
+const decodeMultiAgentConfig = Schema.decodeUnknownOption(MultiAgentConfig);
+
+// Off is represented by absence so legacy and ordinary drafts keep their existing shape.
+function normalizeMultiAgentConfig(value: unknown): MultiAgentConfig | undefined {
+  const config = Option.getOrUndefined(decodeMultiAgentConfig(value));
+  return config?.mode === "off" ? undefined : config;
+}
 
 export const COMPOSER_DRAFT_STORAGE_KEY = "t3code:composer-drafts:v1";
 const COMPOSER_DRAFT_STORAGE_VERSION = 9;
@@ -259,6 +269,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   modelSelectionExplicit: Schema.optionalKey(Schema.Boolean),
   runtimeMode: Schema.optionalKey(RuntimeMode),
   interactionMode: Schema.optionalKey(ProviderInteractionMode),
+  multiAgent: Schema.optionalKey(MultiAgentConfig),
 });
 type PersistedComposerThreadDraftState = typeof PersistedComposerThreadDraftState.Type;
 
@@ -414,6 +425,7 @@ export interface ComposerThreadDraftState {
   modelSelectionExplicit?: boolean;
   runtimeMode: RuntimeMode | null;
   interactionMode: ProviderInteractionMode | null;
+  multiAgent?: MultiAgentConfig;
 }
 
 /**
@@ -509,6 +521,11 @@ interface ComposerDraftStoreState {
   stickyActiveProvider: ProviderInstanceId | null;
   /** Returns the editable composer content for a draft session or server thread. */
   getComposerDraft: (target: ComposerThreadTarget) => ComposerThreadDraftState | null;
+  getMultiAgentConfig: (target: ComposerThreadTarget) => MultiAgentConfig;
+  setMultiAgentConfig: (
+    target: ComposerThreadTarget,
+    config: MultiAgentConfig | null | undefined,
+  ) => void;
   /** Looks up the active draft session for a logical project identity. */
   getDraftThreadByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
   getDraftSessionByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
@@ -983,7 +1000,8 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
     Object.keys(draft.modelSelectionByProvider).length === 0 &&
     draft.activeProvider === null &&
     draft.runtimeMode === null &&
-    draft.interactionMode === null
+    draft.interactionMode === null &&
+    draft.multiAgent === undefined
   );
 }
 
@@ -2081,6 +2099,7 @@ function normalizePersistedDraftsByThreadId(
 
     const hasModelData =
       Object.keys(modelSelectionByProvider).length > 0 || activeProvider !== null;
+    const multiAgent = normalizeMultiAgentConfig(draftCandidate.multiAgent);
     if (
       promptCandidate.length === 0 &&
       attachments.length === 0 &&
@@ -2091,7 +2110,8 @@ function normalizePersistedDraftsByThreadId(
       threadContexts.length === 0 &&
       !hasModelData &&
       !runtimeMode &&
-      !interactionMode
+      !interactionMode &&
+      multiAgent === undefined
     ) {
       continue;
     }
@@ -2124,6 +2144,9 @@ function normalizePersistedDraftsByThreadId(
         : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
       ...(interactionMode ? { interactionMode } : {}),
+      ...(multiAgent === undefined
+        ? {}
+        : { multiAgent: structuredClone(multiAgent) as DeepMutable<MultiAgentConfig> }),
     };
   }
 
@@ -2162,7 +2185,9 @@ function stripLegacyModelSeedsFromEmptyDraftSessions(
         modelSelectionExplicit: _modelSelectionExplicit,
         ...retained
       } = draft;
-      return retained.runtimeMode || retained.interactionMode ? [[threadKey, retained]] : [];
+      return retained.runtimeMode || retained.interactionMode || retained.multiAgent
+        ? [[threadKey, retained]]
+        : [];
     }),
   );
 }
@@ -2227,7 +2252,8 @@ export function partializeComposerDraftStoreState(
       draft.threadContexts.length === 0 &&
       !hasModelData &&
       draft.runtimeMode === null &&
-      draft.interactionMode === null
+      draft.interactionMode === null &&
+      draft.multiAgent === undefined
     ) {
       continue;
     }
@@ -2294,6 +2320,9 @@ export function partializeComposerDraftStoreState(
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
+      ...(draft.multiAgent === undefined
+        ? {}
+        : { multiAgent: structuredClone(draft.multiAgent) as DeepMutable<MultiAgentConfig> }),
     };
     persistedDraftsByThreadKey[threadKey] = persistedDraft;
   }
@@ -2569,6 +2598,7 @@ function toHydratedThreadDraft(
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
+    ...(persistedDraft.multiAgent === undefined ? {} : { multiAgent: persistedDraft.multiAgent }),
   };
 }
 
@@ -2627,6 +2657,24 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
         stickyOptionsByModelByProvider: {},
         stickyActiveProvider: null,
         getComposerDraft: (target) => getComposerDraftState(get(), target),
+        getMultiAgentConfig: (target) =>
+          getComposerDraftState(get(), target)?.multiAgent ?? DEFAULT_MULTI_AGENT_CONFIG,
+        setMultiAgentConfig: (target, config) => {
+          const threadKey = resolveComposerDraftKey(get(), target);
+          if (!threadKey) return;
+          const nextConfig = normalizeMultiAgentConfig(config);
+          set((state) => {
+            const existing = state.draftsByThreadKey[threadKey];
+            if (Equal.equals(existing?.multiAgent, nextConfig)) return state;
+            const nextDraft = { ...(existing ?? createEmptyThreadDraft()) };
+            if (nextConfig === undefined) delete nextDraft.multiAgent;
+            else nextDraft.multiAgent = nextConfig;
+            const draftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(nextDraft)) delete draftsByThreadKey[threadKey];
+            else draftsByThreadKey[threadKey] = nextDraft;
+            return { draftsByThreadKey };
+          });
+        },
         getDraftThreadByLogicalProjectKey: (logicalProjectKey) => {
           return get().getDraftSessionByLogicalProjectKey(logicalProjectKey);
         },
