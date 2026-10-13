@@ -46,7 +46,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       archivedAt: null,
       deletedAt: null,
     } as OrchestrationV2ThreadShell;
-    let launchedSender: ThreadId | undefined;
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
     const layerDependencies = Layer.mergeAll(
       ServerSettings.layerTest(),
       NodeCrypto.layer,
@@ -67,7 +67,7 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({
         launch: (input) => {
-          launchedSender = input.initialMessage?.senderThreadId;
+          launched.push(input);
           return Effect.succeed({
             threadId: input.threadId,
             projection: {
@@ -97,7 +97,16 @@ it.effect("attributes a launched thread's first message to the calling thread", 
       .handle("t3_thread_launch", { title: "Audit", message: "Review the change" })
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
     expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
-    expect(launchedSender).toBe(sourceThreadId);
+    expect(launched[0]?.initialMessage?.senderThreadId).toBe(sourceThreadId);
+    expect(launched[0]?.coordinatorThreadId).toBeUndefined();
+    for (const groupUnderCaller of [false, true]) {
+      yield* toolkit
+        .handle("t3_thread_launch", { title: "Worker", groupUnderCaller })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
+    }
+    expect(launched[1]?.coordinatorThreadId).toBeUndefined();
+    expect(launched[2]?.coordinatorThreadId).toBe(sourceThreadId);
+    expect(launched[2]?.initialMessage).toBeUndefined();
   }),
 );
 
@@ -400,6 +409,10 @@ it.effect("a client launches at its ceiling with the project's default model", (
 
     const escalated = yield* handle({ title: "Fix", projectId, runtimeMode: "full-access" });
     expect(escalated.at(-1)?.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
+
+    const grouped = yield* handle({ title: "Worker", projectId, groupUnderCaller: true });
+    expect(grouped.at(-1)?.result).toMatchObject({ code: "invalid_request" });
+    expect(launched[0]?.coordinatorThreadId).toBeUndefined();
 
     const untargeted = yield* handle({ title: "Fix" });
     expect(untargeted.at(-1)?.result).toMatchObject({ code: "target_required" });

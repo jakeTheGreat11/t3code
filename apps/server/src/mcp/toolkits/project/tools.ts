@@ -113,6 +113,12 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
           "Launch without a project, in its own folder under the environment's Scratch project. Not with projectId or workspaceStrategy.",
       }),
     ),
+    groupUnderCaller: Schema.optional(
+      Schema.Boolean.annotate({
+        description:
+          "Associate this independent thread with the calling T3 thread as its coordinator. Requires a calling thread; does not create a delegated subagent. Omitted or false leaves it ungrouped.",
+      }),
+    ),
     title: TrimmedNonEmptyString,
     modelSelection: Schema.optional(ModelSelection),
     runtimeMode: Schema.optional(RuntimeMode),

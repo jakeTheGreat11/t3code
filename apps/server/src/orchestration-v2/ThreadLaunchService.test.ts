@@ -53,6 +53,8 @@ import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
@@ -2704,4 +2706,54 @@ it.effect("replays an accepted message.dispatch after the project disables the i
       assert.fail(`expected ThreadManagementProviderInstanceDisabledError, got ${fresh._tag}`);
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
+});
+
+it.effect("persists independent worker grouping without changing lineage", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const coordinator = yield* launches.launch(
+      launchInput({ command: "command:coordinator", thread: "thread:coordinator" }),
+    );
+    assert.isUndefined(coordinator.projection.thread.coordinatorThreadId);
+    const worker = yield* launches.launch({
+      ...launchInput({ command: "command:worker", thread: "thread:worker" }),
+      coordinatorThreadId: coordinator.threadId,
+    });
+    const reloaded = yield* threads.getThreadProjection(worker.threadId);
+    assert.equal(reloaded.thread.coordinatorThreadId, coordinator.threadId);
+    assert.deepEqual(reloaded.thread.lineage, {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: worker.threadId,
+    });
+    assert.isNull(reloaded.thread.forkedFrom);
+    const shell = yield* threads.getThreadShell(worker.threadId);
+    assert.equal(shell?.coordinatorThreadId, coordinator.threadId);
+    const events = yield* EventStore.EventStoreV2.pipe(Effect.provide(EventStore.layer));
+    const recorded = yield* events.read({ threadId: worker.threadId }).pipe(Stream.runCollect);
+    const created = recorded.find((stored) => stored.event.type === "thread.created");
+    assert.isDefined(created);
+    if (created?.event.type === "thread.created") {
+      assert.equal(created.event.payload.coordinatorThreadId, coordinator.threadId);
+    }
+    // Rebuild a fresh projection using events read back from persistent storage.
+    yield* Effect.gen(function* () {
+      const replay = yield* ProjectionStore.ProjectionStoreV2;
+      for (const stored of recorded) yield* replay.apply(stored.event);
+      const snapshot = yield* replay.getShellSnapshot();
+      assert.equal(snapshot.threads[0]?.coordinatorThreadId, coordinator.threadId);
+      assert.deepEqual(snapshot.threads[0]?.lineage, reloaded.thread.lineage);
+    }).pipe(Effect.provide(ProjectionStore.layerMemory));
+    // A new SQL projection service must recover the link from the same database.
+    yield* Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const snapshot = yield* projections.getShellSnapshot();
+      assert.equal(
+        snapshot.threads.find((thread) => thread.id === worker.threadId)?.coordinatorThreadId,
+        coordinator.threadId,
+      );
+    }).pipe(Effect.provide(ProjectionStore.layer));
+  }).pipe(Effect.provide(harness.layer));
 });

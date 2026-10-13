@@ -223,3 +223,28 @@ describe("v2 thread shell lists", () => {
     }
   });
 });
+
+it("retains independent worker grouping in frontend shells and live updates", () => {
+  const { registry, threads, snapshotAtom } = makeHarness();
+  const worker = { ...v2ThreadShell, coordinatorThreadId: ThreadId.make("coordinator") };
+  const snapshot = { ...v2ShellSnapshot, threads: [worker] };
+  registry.set(snapshotAtom(environmentId), snapshot);
+  expect(registry.get(threads.navigationThreadShellsAtom)[0]?.coordinatorThreadId).toBe(
+    worker.coordinatorThreadId,
+  );
+  registry.set(
+    snapshotAtom(environmentId),
+    applyShellStreamEvent(snapshot, {
+      kind: "thread.updated",
+      location: "active",
+      sequence: 1,
+      thread: { ...worker, title: "Updated worker" },
+    }),
+  );
+  expect(registry.get(threads.threadShellsAtom)[0]).toMatchObject({
+    coordinatorThreadId: worker.coordinatorThreadId,
+    title: "Updated worker",
+    lineage: v2ThreadShell.lineage,
+  });
+  registry.dispose();
+});

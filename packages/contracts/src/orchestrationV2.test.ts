@@ -128,6 +128,10 @@ const encodeOrchestrationV2ProviderThreadJson = Schema.encodeSync(
 );
 const decodeOrchestrationV2ProviderThread = Schema.decodeUnknownSync(OrchestrationV2ProviderThread);
 const decodeOrchestrationV2ThreadShell = Schema.decodeUnknownSync(OrchestrationV2ThreadShell);
+const encodeThreadShell = Schema.encodeSync(OrchestrationV2ThreadShell);
+const decodeThreadShell = Schema.decodeSync(OrchestrationV2ThreadShell);
+const encodeThreadProjection = Schema.encodeSync(OrchestrationV2ThreadProjection);
+const decodeThreadProjection = Schema.decodeSync(OrchestrationV2ThreadProjection);
 const decodeOrchestrationV2ProviderCapabilities = Schema.decodeUnknownSync(
   OrchestrationV2ProviderCapabilities,
 );
@@ -1313,6 +1317,11 @@ describe("orchestration V2 contracts", () => {
     });
 
     expect(shell.pendingBackgroundTasks).toEqual([]);
+    expect(shell.coordinatorThreadId).toBeUndefined();
+    const grouped = { ...shell, coordinatorThreadId: ThreadId.make("coordinator") };
+    expect(decodeThreadShell(encodeThreadShell(grouped)).coordinatorThreadId).toBe(
+      grouped.coordinatorThreadId,
+    );
   });
 });
 
@@ -1567,4 +1576,17 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
+});
+
+it("decodes legacy threads and round-trips optional coordinator grouping", () => {
+  const legacy = decodeOrchestrationV2ThreadProjection(emptyThreadProjection());
+  expect(legacy.thread.coordinatorThreadId).toBeUndefined();
+  const input = emptyThreadProjection();
+  const grouped = decodeOrchestrationV2ThreadProjection({
+    ...input,
+    thread: { ...input.thread, coordinatorThreadId: "coordinator" },
+  });
+  const decoded = decodeThreadProjection(encodeThreadProjection(grouped));
+  expect(decoded.thread.coordinatorThreadId).toBe("coordinator");
+  expect(decoded.thread.lineage).toEqual(legacy.thread.lineage);
 });

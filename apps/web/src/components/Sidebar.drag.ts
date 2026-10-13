@@ -1,7 +1,7 @@
+import { resolveSidebarHierarchyDropTarget } from "./Sidebar.hierarchy";
 import { closestCenter, type CollisionDetection, type Modifier } from "@dnd-kit/core";
 import { verticalListSortingStrategy, type SortingStrategy } from "@dnd-kit/sortable";
 import {
-  resolveSidebarDropTarget,
   sidebarListItemId,
   sidebarMarkerId,
   type SidebarListItem,
@@ -18,6 +18,22 @@ const isShelfHeader = (item: SidebarListItem | undefined) =>
   (item.marker === "working-header" ||
     item.marker === "snoozed-header" ||
     item.marker === "settled-header");
+
+/** Workers use the existing pointer sensor for composer context drops.
+ * The hierarchy drop resolver separately rejects them as reorder sources. */
+export function canDragSidebarThread(input: {
+  readonly isWorker: boolean;
+  readonly section: SidebarSection;
+  readonly reorderable: boolean;
+  readonly renaming: boolean;
+  readonly dropPending: boolean;
+}) {
+  return (
+    !input.renaming &&
+    !input.dropPending &&
+    (input.isWorker || (input.section !== "working" && input.reorderable))
+  );
+}
 
 /** Keep the lifted card below the Pins label, including when Pins is empty.
  * The container rect follows scrolling; the offset is measured once at pickup. */
@@ -36,6 +52,7 @@ export function createSidebarCollisionDetection(
   isValidTarget: (id: string) => boolean,
   options: {
     items?: readonly SidebarListItem[];
+    groupRootByKey?: ReadonlyMap<string, string>;
     activationY?: number | null;
   } = {},
 ): CollisionDetection {
@@ -74,7 +91,12 @@ export function createSidebarCollisionDetection(
             if (!sections.has(id)) {
               sections.set(
                 id,
-                resolveSidebarDropTarget(items, String(args.active.id), id)?.section ?? null,
+                resolveSidebarHierarchyDropTarget(
+                  items,
+                  String(args.active.id),
+                  id,
+                  options.groupRootByKey,
+                )?.section ?? null,
               );
             }
             return sections.get(id) === boundarySection;
@@ -99,6 +121,7 @@ export function createSidebarCollisionDetection(
  * A zero scaleY marks rows/markers to hide while retaining their measured nodes. */
 export function createSidebarSortingStrategy(input: {
   items: readonly SidebarListItem[];
+  groupRootByKey?: ReadonlyMap<string, string>;
   /** Suspend the reorder preview while the thread is dragged out as context. */
   enabled?: boolean;
   settledOrder: readonly string[];
@@ -116,6 +139,15 @@ export function createSidebarSortingStrategy(input: {
 }): SortingStrategy {
   if (input.enabled === false) return () => stationary;
   const { items } = input;
+  const workersByRoot = new Map<string, ThreadItem[]>();
+  for (const item of items) {
+    if (item.kind !== "thread") continue;
+    const root = input.groupRootByKey?.get(item.key);
+    if (root === undefined || root === item.key) continue;
+    const workers = workersByRoot.get(root) ?? [];
+    workers.push(item);
+    workersByRoot.set(root, workers);
+  }
   const indices = new Map(items.map((item, index) => [sidebarListItemId(item), index]));
   let previous: Pick<Layout, "rects" | "activeIndex" | "overIndex"> | undefined;
   let transforms: ReturnType<SortingStrategy>[] | null = [];
@@ -124,7 +156,12 @@ export function createSidebarSortingStrategy(input: {
     const active = items[activeIndex];
     const over = items[overIndex] ?? active;
     if (active?.kind !== "thread" || !over || !rects[0]) return [];
-    const target = resolveSidebarDropTarget(items, active.key, sidebarListItemId(over));
+    const target = resolveSidebarHierarchyDropTarget(
+      items,
+      active.key,
+      sidebarListItemId(over),
+      input.groupRootByKey,
+    );
     if (!target) return [];
     const groups: Record<SidebarSection, ThreadItem[]> = {
       pinned: [],
@@ -144,6 +181,7 @@ export function createSidebarSortingStrategy(input: {
         }
         continue;
       }
+      if ((input.groupRootByKey?.get(item.key) ?? item.key) !== item.key) continue;
       if (item.section === "pinned" || item.section === "active" || item.section === "working")
         cardHeight ??= rects[index]?.height;
       else slimHeight ??= rects[index]?.height;
@@ -174,12 +212,15 @@ export function createSidebarSortingStrategy(input: {
     const visible = input.settledExpanded
       ? settledOrder.slice(0, input.settledVisibleCount ?? settledOrder.length)
       : [];
-    const routeKey = input.routeThreadKey;
+    const routeKey =
+      input.routeThreadKey == null
+        ? input.routeThreadKey
+        : (input.groupRootByKey?.get(input.routeThreadKey) ?? input.routeThreadKey);
     if (routeKey && settledOrder.includes(routeKey) && !visible.includes(routeKey)) {
       visible.push(routeKey);
     }
     groups.settled = visible.map((key) => ({ kind: "thread", key, section: "settled" }));
-    const projected: SidebarListItem[] = [];
+    let projected: SidebarListItem[] = [];
     const marker = (name: SidebarListMarker) => projected.push({ kind: "marker", marker: name });
     const section = (name: "active" | "settled") => {
       if (groups[name].length > 0) projected.push(...groups[name]);
@@ -203,6 +244,17 @@ export function createSidebarSortingStrategy(input: {
     }
     marker("settled-header");
     section("settled");
+    projected = projected.flatMap<SidebarListItem>((item) =>
+      item.kind === "thread"
+        ? [
+            item,
+            ...(workersByRoot.get(item.key) ?? []).map((worker) => ({
+              ...worker,
+              section: item.section,
+            })),
+          ]
+        : [item],
+    );
     const heights = projected.map((item) => {
       const index = indices.get(sidebarListItemId(item));
       const rect = index === undefined ? undefined : rects[index];

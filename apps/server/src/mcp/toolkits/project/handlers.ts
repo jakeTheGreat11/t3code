@@ -59,6 +59,11 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       Effect.gen(function* () {
         const context = yield* readCaller();
         const { caller } = context;
+        if (input.groupUnderCaller === true && caller === undefined)
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "groupUnderCaller:true requires a calling T3 thread.",
+          });
         const commandId = yield* newCommandId();
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);
@@ -136,6 +141,9 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               "Pass modelSelection: the project has no default model. orchestrator_capabilities lists providers and models.",
           });
         const result = yield* ThreadMessageIntake.launchThread({
+          ...(input.groupUnderCaller === true && caller !== undefined
+            ? { coordinatorThreadId: caller.id }
+            : {}),
           commandId,
           threadId,
           projectId,

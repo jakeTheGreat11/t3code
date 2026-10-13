@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { closestCenter, type CollisionDetection } from "@dnd-kit/core";
 import { verticalListSortingStrategy, type SortingStrategy } from "@dnd-kit/sortable";
 import {
+  canDragSidebarThread,
   createSidebarCollisionDetection,
   createSidebarSortingStrategy,
   restrictBelowSidebarLabel,
 } from "./Sidebar.drag";
 import {
+  planSidebarThreadDrop,
   resolveSidebarDropTarget,
   sidebarListItemId,
   sidebarMarkerId,
@@ -14,6 +16,7 @@ import {
   type SidebarListMarker,
   type SidebarSection,
 } from "./Sidebar.logic";
+import { resolveSidebarHierarchyDropTarget } from "./Sidebar.hierarchy";
 
 const thread = (key: string, section: SidebarSection): SidebarListItem => ({
   kind: "thread",
@@ -67,6 +70,189 @@ function preview(
     input.items.map((item, index) => [sidebarListItemId(item), strategy({ ...args, index })]),
   );
 }
+
+describe("coordinator group dragging", () => {
+  it.each(["pinned", "active", "working", "snoozed", "settled"] as const)(
+    "allows a worker in %s to start the context drag sensor without reorder support",
+    (section) => {
+      expect(
+        canDragSidebarThread({
+          isWorker: true,
+          section,
+          reorderable: false,
+          renaming: false,
+          dropPending: false,
+        }),
+      ).toBe(true);
+    },
+  );
+
+  it("keeps rename and pending-drop guards on worker gestures", () => {
+    const worker = {
+      isWorker: true,
+      section: "active" as const,
+      reorderable: false,
+      renaming: false,
+      dropPending: false,
+    };
+    expect(canDragSidebarThread({ ...worker, renaming: true })).toBe(false);
+    expect(canDragSidebarThread({ ...worker, dropPending: true })).toBe(false);
+  });
+
+  it.each(["pinned", "active", "working", "snoozed", "settled"] as const)(
+    "preserves unrelated %s thread drag eligibility",
+    (section) => {
+      const root = {
+        isWorker: false,
+        section,
+        reorderable: true,
+        renaming: false,
+        dropPending: false,
+      };
+      expect(canDragSidebarThread(root)).toBe(section !== "working");
+      expect(canDragSidebarThread({ ...root, reorderable: false })).toBe(false);
+    },
+  );
+
+  it("never reorders or previews a worker as an independent root", () => {
+    const items = [
+      pinnedHeader,
+      thread("coordinator", "pinned"),
+      thread("worker", "pinned"),
+      divider,
+      thread("unrelated", "active"),
+      settledHeader,
+      marker("settled-placeholder"),
+    ];
+    const groupRootByKey = new Map([["worker", "coordinator"]]);
+    const input = { items, groupRootByKey, settledOrder: [], settledExpanded: false };
+    for (const over of ["coordinator", "unrelated", sidebarMarkerId("settled-header")]) {
+      expect(resolveSidebarHierarchyDropTarget(items, "worker", over, groupRootByKey)).toBeNull();
+      expect([...preview(input, "worker", over).values()]).toEqual(items.map(() => stationary));
+    }
+    // Leaving the sidebar uses the same context-drag suspension as ordinary rows.
+    expect([...preview({ ...input, enabled: false }, "worker", "unrelated").values()]).toEqual(
+      items.map(() => stationary),
+    );
+  });
+
+  it.each(["pinned", "active"] as const)(
+    "resolves worker targets to their group and writes only %s root ordering keys",
+    (section) => {
+      const rows = [
+        thread("coordinator", section),
+        thread("worker", section),
+        thread("nested-worker", section),
+        thread("other-coordinator", section),
+        thread("other-worker", section),
+        thread("source", section),
+      ];
+      const items =
+        section === "pinned"
+          ? [pinnedHeader, ...rows, divider, settledHeader]
+          : [pinnedHeader, divider, ...rows, settledHeader];
+      const groupRootByKey = new Map([
+        ["worker", "coordinator"],
+        ["nested-worker", "coordinator"],
+        ["other-worker", "other-coordinator"],
+      ]);
+      const keys = new Map(rows.map((row) => [sidebarListItemId(row), null]));
+      for (const over of ["worker", "nested-worker"]) {
+        const target = resolveSidebarHierarchyDropTarget(items, "source", over, groupRootByKey);
+        expect(target).toEqual(
+          resolveSidebarHierarchyDropTarget(items, "source", "coordinator", groupRootByKey),
+        );
+        expect(target?.[section === "pinned" ? "pinnedOrder" : "activeOrder"]).toEqual([
+          "source",
+          "coordinator",
+          "other-coordinator",
+        ]);
+        if (target === null) throw new Error("Expected a reorder target");
+        const plan = planSidebarThreadDrop({
+          activeKey: "source",
+          activeSection: section,
+          target,
+          pinnedOrder: section === "pinned" ? ["coordinator", "other-coordinator", "source"] : [],
+          pinnedKeysById: keys,
+          activeOrder: section === "active" ? ["coordinator", "other-coordinator", "source"] : [],
+          activeKeysById: keys,
+        });
+        expect(plan.kind).toBe(section === "pinned" ? "reorder-pinned" : "move-active");
+        if (plan.kind !== "reorder-pinned" && plan.kind !== "move-active") {
+          throw new Error("Expected ordering assignments");
+        }
+        expect(plan.assignments.map(({ id }) => id).sort()).toEqual([
+          "coordinator",
+          "other-coordinator",
+          "source",
+        ]);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "retains a routed worker's settled group during preview with shelf expanded=%s",
+    (settledExpanded) => {
+      const items = [
+        pinnedHeader,
+        thread("pin", "pinned"),
+        divider,
+        thread("source", "active"),
+        settledHeader,
+        ...(settledExpanded ? [thread("history", "settled")] : []),
+        thread("coordinator", "settled"),
+        thread("worker", "settled"),
+        thread("nested-worker", "settled"),
+      ];
+      const result = preview(
+        {
+          items,
+          groupRootByKey: new Map([
+            ["worker", "coordinator"],
+            ["nested-worker", "coordinator"],
+          ]),
+          settledOrder: ["history", "coordinator"],
+          settledExpanded,
+          settledVisibleCount: 1,
+          routeThreadKey: "nested-worker",
+        },
+        "source",
+        "pin",
+      );
+      for (const key of ["coordinator", "worker", "nested-worker"]) {
+        expect(result.get(key)?.scaleY).toBe(1);
+      }
+      const positions = layout(items, "source", "pin");
+      const projectedTop = (key: string) => {
+        const index = items.findIndex((item) => sidebarListItemId(item) === key);
+        return positions.rects[index]!.top + result.get(key)!.y;
+      };
+      expect(projectedTop("worker") - projectedTop("coordinator")).toBe(37);
+      expect(projectedTop("nested-worker") - projectedTop("worker")).toBe(37);
+    },
+  );
+
+  it("preserves unrelated drop targets and previews when no worker is routed", () => {
+    const items = [
+      pinnedHeader,
+      thread("pin", "pinned"),
+      divider,
+      thread("source", "active"),
+      settledHeader,
+    ];
+    const input = { items, settledOrder: [], settledExpanded: true, routeThreadKey: "source" };
+    const groupRootByKey = new Map([
+      ["source", "source"],
+      ["pin", "pin"],
+    ]);
+    expect(resolveSidebarHierarchyDropTarget(items, "source", "pin", groupRootByKey)).toEqual(
+      resolveSidebarDropTarget(items, "source", "pin"),
+    );
+    expect(preview({ ...input, groupRootByKey }, "source", "pin")).toEqual(
+      preview(input, "source", "pin"),
+    );
+  });
+});
 
 describe("sidebar collision detection", () => {
   function collisionArgs(blockedAboveSource = false) {
