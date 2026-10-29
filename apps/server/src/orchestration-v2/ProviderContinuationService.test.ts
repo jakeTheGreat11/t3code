@@ -108,6 +108,41 @@ function layerTest(input: {
 }
 
 describe("ProviderContinuationService", () => {
+  it.effect(
+    "denies duplicate controlled Codex wakes before dispatch or destructive callbacks",
+    () =>
+      Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const callbacks = yield* Ref.make(0);
+        const owned = {
+          ...projection,
+          runs: [{ id: parentRunId, controlledWorkerOwnership: { providerThreadId } }],
+          providerThreads: [{ id: providerThreadId, driver: "codex" }],
+        } as unknown as OrchestrationV2ThreadProjection;
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          for (let delivery = 0; delivery < 2; delivery++)
+            yield* requests.offer({
+              ...request(),
+              driver: ProviderDriverKind.make("codex"),
+              clearIfCurrent: () => Ref.update(callbacks, (n) => n + 1),
+              dispatchIfCurrent: (effect) =>
+                Ref.update(callbacks, (n) => n + 1).pipe(
+                  Effect.andThen(effect),
+                  Effect.map(Option.some),
+                ),
+            });
+          // FIFO sentinel proves both denials were processed without sleeps.
+          yield* requests.offer(request());
+          yield* Queue.take(dispatched);
+          assert.equal(yield* Ref.get(callbacks), 0);
+          assert.equal(yield* Queue.size(dispatched), 0);
+        }).pipe(
+          Effect.provide(layerTest({ dispatched, getThreadRecords: () => Effect.succeed(owned) })),
+          Effect.scoped,
+        );
+      }),
+  );
   it.effect("recovers an unaccepted persisted steer using the same delivery identity", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

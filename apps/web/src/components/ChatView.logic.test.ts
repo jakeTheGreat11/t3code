@@ -1,4 +1,8 @@
-import { findRecordedWorktreeSetup, resolveVisibleWorktreeSetup } from "./ChatView.logic";
+import {
+  findRecordedWorktreeSetup,
+  resolveVisibleWorktreeSetup,
+  stoppableCoordinatorRunId,
+} from "./ChatView.logic";
 import {
   recallCheckoutIsRepo,
   rememberCheckoutIsRepo,
@@ -28,6 +32,64 @@ import type { CodexArtifactTemplate } from "@t3tools/shared/codexArtifactTemplat
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+
+it("offers Stop for an open coordinator after provider completion, without reaching later manual runs", () => {
+  const run = {
+    id: RunId.make("coordinator"),
+    ordinal: 1,
+    multiAgentController: { status: "open" as const },
+  };
+  expect(stoppableCoordinatorRunId([run])).toBe(run.id);
+  expect(
+    stoppableCoordinatorRunId([
+      {
+        ...run,
+        multiAgentController: {
+          ...run.multiAgentController,
+          coordinatorStoppedAt: "2026-10-15T00:00:00Z",
+        },
+      },
+    ]),
+  ).toBeUndefined();
+  expect(
+    stoppableCoordinatorRunId([run, { id: RunId.make("manual"), ordinal: 2 }]),
+  ).toBeUndefined();
+  expect(stoppableCoordinatorRunId([])).toBeUndefined();
+});
+it("targets the exact review execution and respects the original Stop barrier", () => {
+  const original = {
+    id: RunId.make("original-controller"),
+    ordinal: 1,
+    multiAgentController: { status: "open" as const },
+  };
+  const review = {
+    id: RunId.make("review"),
+    ordinal: 2,
+    multiAgentReview: { coordinatorRunId: original.id },
+  };
+  expect(stoppableCoordinatorRunId([original, review])).toBe(review.id);
+  expect(
+    stoppableCoordinatorRunId([
+      { ...original, multiAgentController: { status: "settled" } },
+      review,
+    ]),
+  ).toBeUndefined();
+  expect(
+    stoppableCoordinatorRunId([
+      {
+        ...original,
+        multiAgentController: {
+          ...original.multiAgentController,
+          coordinatorStoppedAt: "2026-10-15T00:00:00Z",
+        },
+      },
+      review,
+    ]),
+  ).toBeUndefined();
+  expect(
+    stoppableCoordinatorRunId([original, review, { id: RunId.make("later-manual"), ordinal: 3 }]),
+  ).toBeUndefined();
+});
 import { Atom, AsyncResult } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";

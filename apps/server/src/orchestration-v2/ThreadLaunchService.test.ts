@@ -15,6 +15,10 @@ import {
   ComposerContextId,
   type ChatAttachment,
   CommandId,
+  EventId,
+  NodeId,
+  RunAttemptId,
+  RunId,
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
   MessageId,
@@ -25,6 +29,9 @@ import {
   ScheduledTaskId,
   type ServerProvider,
   type MultiAgentConfig,
+  type MultiAgentControllerTask,
+  type OrchestrationV2Run,
+  type ModelSelection,
   orchestrationV2RunMultiAgentConfig,
   ThreadId,
 } from "@t3tools/contracts";
@@ -55,11 +62,15 @@ import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as EventSink from "./EventSink.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
@@ -151,7 +162,11 @@ function makeHarness(options: HarnessOptions = {}) {
   const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
     { name: "thread-launch" },
     layerRegistry,
-    { databaseLayer: layerDatabase, runEffectWorker: false },
+    {
+      databaseLayer: layerDatabase,
+      runEffectWorker: false,
+      providerCatalog: options.providers ?? [launchCatalogProvider],
+    },
   );
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
@@ -271,10 +286,18 @@ function makeHarness(options: HarnessOptions = {}) {
   );
   return {
     layer: Layer.mergeAll(
+      MultiAgentWorkerLaunchService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(layerLaunch, layerThreadManagement, layerReceipts, layerExternalServices),
+        ),
+      ),
+      layerReceipts,
+      layerOrchestrator,
       layerLaunch,
       layerThreadManagement,
       layerTitleRegeneration,
       layerOutbox,
+      ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
       layerDatabase,
       layerExternalServices,
     ),
@@ -498,7 +521,34 @@ it.effect.each([
 ] satisfies Array<{ name: string; config: MultiAgentConfig | undefined }>)(
   "snapshots $name preferences through launch, queue, reload, and event replay",
   (testCase) => {
-    const harness = makeHarness({ runSetup: () => Effect.never });
+    const harness = makeHarness({
+      runSetup: () => Effect.never,
+      providers: [
+        launchCatalogProvider,
+        {
+          ...launchCatalogProvider,
+          instanceId: ProviderInstanceId.make("configured-worker"),
+          models: [
+            {
+              slug: "catalog-model",
+              name: "Policy fixture",
+              isCustom: true,
+              capabilities: {
+                optionDescriptors: [
+                  {
+                    id: "catalog-option",
+                    label: "Option",
+                    type: "select",
+                    options: [{ id: "catalog-value", label: "Value" }],
+                  },
+                  { id: "catalog-boolean", label: "Boolean", type: "boolean" },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
     const layerFiles = ServerConfig.layerTest(process.cwd(), { prefix: "t3-run-policy-" }).pipe(
       Layer.provideMerge(NodeServices.layer),
     );
@@ -3016,6 +3066,752 @@ it.effect("replays an accepted message.dispatch after the project disables the i
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
 });
 
+const seedControlledLaunch = Effect.fn("seedControlledLaunch")(function* (
+  config: MultiAgentConfig = { mode: "custom", roles: { worker: modelSelection } },
+  status: "queued" | "reserved" = "reserved",
+  assignedSelection: ModelSelection = modelSelection,
+  role: MultiAgentControllerTask["role"] = "worker",
+) {
+  const launches = yield* ThreadLaunch.ThreadLaunchService;
+  const launched = yield* launches.launch({
+    ...launchInput({ command: "controller:create", thread: "controller:thread" }),
+  });
+  // Legacy controllers can contain assignments that are no longer available.
+  // Seed their persisted state directly; fresh dispatch now validates enrollment.
+  const run: OrchestrationV2Run = {
+    id: RunId.make("controller:run"),
+    threadId: launched.threadId,
+    ordinal: 1,
+    providerInstanceId: modelSelection.instanceId,
+    modelSelection,
+    multiAgent: config,
+    providerThreadId: null,
+    userMessageId: MessageId.make("controller:input"),
+    rootNodeId: NodeId.make("controller:root"),
+    activeAttemptId: RunAttemptId.make("controller:attempt"),
+    status: "completed",
+    requestedAt: yield* DateTime.now,
+    startedAt: null,
+    completedAt: yield* DateTime.now,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const task: MultiAgentControllerTask = {
+    key: "task",
+    taskId: NodeId.make("controlled:task"),
+    launchCommandId: CommandId.make("controlled:launch"),
+    launchMessageId: MessageId.make("controlled:message"),
+    workerThreadId: ThreadId.make("controlled:worker"),
+    proposalId: MessageId.make("controller:proposal"),
+    proposalAttemptId: RunAttemptId.make("controller:attempt"),
+    role,
+    prompt: "Do the authorized task",
+    title: "Worker",
+    modelSelection: assignedSelection,
+    status,
+  };
+  const sink = yield* EventSink.EventSinkV2;
+  yield* sink.write({
+    events: [
+      {
+        id: EventId.make("controller:run"),
+        type: "run.created",
+        threadId: launched.threadId,
+        runId: run.id,
+        occurredAt: yield* DateTime.now,
+        payload: run,
+      },
+      {
+        id: EventId.make("controller:state"),
+        type: "multi-agent.controller.updated",
+        threadId: launched.threadId,
+        runId: run.id,
+        occurredAt: yield* DateTime.now,
+        payload: {
+          state: {
+            coordinatorThreadId: launched.threadId,
+            coordinatorRunId: run.id,
+            status: "open",
+            tasks: [task],
+          },
+          expectedRevision: 0,
+          revision: 1,
+        },
+      },
+    ],
+  });
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const start = (commandKey = "controller:launch-request") =>
+    orchestrator.dispatch({
+      type: "multi-agent.controller.command",
+      commandId: CommandId.make(commandKey),
+      threadId: launched.threadId,
+      runId: run.id,
+      action: { type: "launch", taskId: task.taskId },
+    });
+  const input = {
+    threadId: launched.threadId,
+    coordinatorRunId: run.id,
+    taskId: task.taskId,
+    launchCommandId: task.launchCommandId,
+  };
+  const workerInput: ThreadLaunch.ThreadLaunchInput = {
+    ...launchInput({ command: task.launchCommandId, thread: task.workerThreadId }),
+    coordinatorThreadId: launched.threadId,
+    controlledWorkerLaunchOwner: {
+      coordinatorThreadId: launched.threadId,
+      coordinatorRunId: run.id,
+      taskId: task.taskId,
+      workerThreadId: task.workerThreadId,
+      launchCommandId: task.launchCommandId,
+      launchMessageId: task.launchMessageId,
+    },
+    modelSelection: task.modelSelection,
+    title: "Worker",
+    validateExplicitModelSelection: true,
+    initialMessage: {
+      messageId: task.launchMessageId,
+      text: task.prompt,
+      attachments: [],
+      multiAgent: { mode: "off" },
+      senderThreadId: launched.threadId,
+    },
+    createdBy: "system",
+    creationSource: "server",
+  };
+  const readTask = () =>
+    orchestrator
+      .getThreadRecords(launched.threadId, ["runs"], { runIds: [run.id] })
+      .pipe(Effect.map((records) => records.runs[0]!.multiAgentController!.tasks[0]!));
+  return { run, task, start, input, workerInput, readTask };
+});
+
+it.effect.each(["worker", "rescuer", "reviewer"] as const)(
+  "launches the configured %s model with valid provider-specific options",
+  (role) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const selection = {
+        ...modelSelection,
+        options: [
+          { id: "effort", value: "supported" },
+          { id: "feature", value: false },
+        ],
+      };
+      const owner = yield* seedControlledLaunch(
+        { mode: "custom", roles: { [role]: selection } },
+        "reserved",
+        selection,
+        role,
+      );
+      yield* owner.start();
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      yield* executor.execute(owner.input);
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const worker = yield* threads.getThreadProjection(owner.task.workerThreadId);
+      assert.deepEqual(worker.runs[0]!.modelSelection, selection);
+      assert.deepEqual(worker.runs[0]!.multiAgent, { mode: "off" });
+      assert.equal((yield* owner.readTask()).status, "running");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each(["returned", "lost-response"] as const)(
+  "settles a worker that finished before launch registration (%s)",
+  (boundary) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      yield* owner.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      const fastLaunch = {
+        ...launches,
+        launch: (input: ThreadLaunch.ThreadLaunchInput) =>
+          Effect.gen(function* () {
+            const launched = yield* launches.launch(input);
+            const rows = yield* projections.getThreadRecords(owner.task.workerThreadId, [
+              "runs",
+              "attempts",
+            ]);
+            const run = rows.runs[0]!;
+            const at = yield* DateTime.now;
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make(`fast:${boundary}:run`),
+                  type: "run.updated",
+                  threadId: run.threadId,
+                  runId: run.id,
+                  occurredAt: at,
+                  payload: { ...run, status: "completed", completedAt: at },
+                },
+                {
+                  id: EventId.make(`fast:${boundary}:attempt`),
+                  type: "run-attempt.updated",
+                  threadId: run.threadId,
+                  runId: run.id,
+                  occurredAt: at,
+                  payload: { ...rows.attempts[0]!, status: "completed", completedAt: at },
+                },
+              ],
+            });
+            assert.equal((yield* owner.readTask()).status, "launching");
+            const completion = Orchestrator.controlledWorkerFinishedCommand(
+              run.controlledWorkerOwnership!,
+            );
+            assert.isTrue(Option.isNone(yield* receipts.getByCommandId(completion.commandId)));
+            if (boundary === "lost-response")
+              return yield* new ThreadLaunch.ThreadLaunchError({
+                commandId: input.commandId,
+                operation: "dispatch-message",
+                projectId: input.projectId,
+                cause: "Lost terminal worker launch response",
+              });
+            return launched;
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ThreadLaunch.ThreadLaunchError({
+                  commandId: input.commandId,
+                  operation: "dispatch-message",
+                  projectId: input.projectId,
+                  cause,
+                }),
+            ),
+          ),
+      };
+      const first = yield* Effect.gen(function* () {
+        const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+        yield* executor.execute(owner.input);
+      }).pipe(
+        Effect.provide(
+          Layer.fresh(MultiAgentWorkerLaunchService.layer).pipe(
+            Layer.provide(Layer.succeed(ThreadLaunch.ThreadLaunchService, fastLaunch)),
+          ),
+        ),
+        Effect.exit,
+      );
+      if (boundary === "lost-response") {
+        assert.isTrue(Exit.isFailure(first));
+        yield* (yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService).execute(
+          owner.input,
+        );
+      } else assert.isTrue(Exit.isSuccess(first));
+      assert.equal((yield* owner.readTask()).status, "completed");
+      const before = (yield* projections.getThreadRecords(owner.input.threadId, ["runs"])).runs[0]!;
+      yield* (yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService).execute(
+        owner.input,
+      );
+      const after = (yield* projections.getThreadRecords(owner.input.threadId, ["runs"])).runs[0]!;
+      assert.equal(after.multiAgentControllerRevision, before.multiAgentControllerRevision);
+      assert.lengthOf(
+        (yield* projections.getThreadRecords(owner.task.workerThreadId, ["runs"])).runs,
+        1,
+      );
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("atomically queues only reserved launches and deduplicates repeated commands", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch(undefined, "queued");
+    assert.isTrue(
+      Exit.isFailure(yield* owner.start("controller:invalid-launch").pipe(Effect.exit)),
+    );
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    assert.deepEqual(
+      yield* outbox.listByCommandId(CommandId.make("controller:launch-request")),
+      [],
+    );
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "multi-agent.controller.command",
+      commandId: CommandId.make("controller:reserve"),
+      threadId: owner.input.threadId,
+      runId: owner.run.id,
+      action: { type: "reserve", taskId: owner.task.taskId },
+    });
+    yield* owner.start();
+    yield* owner.start();
+    assert.equal((yield* owner.readTask()).status, "launching");
+    const effects = yield* outbox.listByCommandId(CommandId.make("controller:launch-request"));
+    assert.equal(effects.length, 1);
+    assert.deepEqual(effects[0]!.request, {
+      type: "multi-agent.worker.launch",
+      coordinatorRunId: owner.run.id,
+      taskId: owner.task.taskId,
+      launchCommandId: owner.task.launchCommandId,
+    });
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect.each(["before-create", "after-create", "after-message"] as const)(
+  "recovers durable worker launch at crash boundary %s without duplicates",
+  (boundary) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      yield* owner.start();
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      if (boundary === "after-create") {
+        const { initialMessage: _message, ...createOnly } = owner.workerInput;
+        yield* launches.launch(createOnly);
+      } else if (boundary === "after-message") yield* launches.launch(owner.workerInput);
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      const previousMessage = yield* receipts.getByCommandId(
+        CommandId.make(`${owner.task.launchCommandId}:initial-message`),
+      );
+      // Reacquire a fresh controller service, as after a process restart. The SQL
+      // receipts and projections are authoritative, not its in-memory lock.
+      yield* Effect.gen(function* () {
+        const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+        yield* Effect.all([executor.execute(owner.input), executor.execute(owner.input)], {
+          concurrency: 2,
+        });
+      }).pipe(Effect.provide(Layer.fresh(MultiAgentWorkerLaunchService.layer)));
+      const current = yield* owner.readTask();
+      assert.equal(current.status, "running");
+      assert.isTrue("workerRunId" in current && current.workerRunId !== undefined);
+      const worker = yield* threads.getThreadProjection(owner.task.workerThreadId);
+      assert.equal(worker.runs.length, 1);
+      assert.deepEqual(worker.runs[0]!.multiAgent, { mode: "off" });
+      assert.equal(worker.thread.coordinatorThreadId, owner.input.threadId);
+      assert.isNull(worker.thread.lineage.parentThreadId);
+      assert.equal(worker.runs[0]!.userMessageId, owner.task.launchMessageId);
+      if (Option.isSome(previousMessage)) {
+        const recovered = yield* receipts.getByCommandId(
+          CommandId.make(`${owner.task.launchCommandId}:initial-message`),
+        );
+        assert.deepEqual(recovered, previousMessage);
+      }
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const pending = (yield* outbox.listByCommandId(
+        CommandId.make("controller:launch-request"),
+      ))[0]!;
+      assert.isTrue(
+        EffectOutbox.REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS.includes(
+          "multi-agent.worker.launch",
+        ),
+      );
+      // Durable outbox reconciliation also retains the request across restart.
+      yield* outbox.reconcileAfterProcessLoss;
+      assert.isTrue(Option.isSome(yield* outbox.get(pending.id)));
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each([
+  { name: "unassigned", config: { mode: "custom", roles: {} } },
+  {
+    name: "unavailable-model",
+    config: { mode: "custom", roles: { worker: { ...modelSelection, model: "missing" } } },
+  },
+  {
+    name: "foreign-provider",
+    config: {
+      mode: "custom",
+      roles: { worker: { ...modelSelection, instanceId: ProviderInstanceId.make("foreign") } },
+    },
+  },
+  {
+    name: "invalid-option",
+    config: {
+      mode: "custom",
+      roles: { worker: { ...modelSelection, options: [{ id: "effort", value: "invalid" }] } },
+    },
+  },
+] satisfies ReadonlyArray<{ name: string; config: MultiAgentConfig }>)(
+  "rejects Custom assignment %s before creation and releases its slot",
+  ({ config }) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch(config);
+      yield* owner.start();
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      yield* executor.execute(owner.input);
+      assert.equal((yield* owner.readTask()).status, "failed");
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+      yield* executor.execute(owner.input);
+      assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each(["before-create", "after-create", "after-message"] as const)(
+  "retains uncertain capacity after a lost launch response (%s) and recovers safely",
+  (boundary) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      yield* owner.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const lostResponse = {
+        ...launches,
+        launch: (input: ThreadLaunch.ThreadLaunchInput) =>
+          Effect.gen(function* () {
+            if (boundary === "after-create") {
+              const { initialMessage: _message, ...createOnly } = input;
+              yield* launches.launch(createOnly);
+            } else if (boundary === "after-message") yield* launches.launch(input);
+            return yield* new ThreadLaunch.ThreadLaunchError({
+              commandId: input.commandId,
+              projectId: input.projectId,
+              operation: "dispatch-message",
+              cause: "Lost response",
+            });
+          }),
+      };
+      const failed = yield* Effect.gen(function* () {
+        const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+        yield* executor.execute(owner.input);
+      }).pipe(
+        Effect.provide(
+          Layer.fresh(MultiAgentWorkerLaunchService.layer).pipe(
+            Layer.provide(Layer.succeed(ThreadLaunch.ThreadLaunchService, lostResponse)),
+          ),
+        ),
+        Effect.exit,
+      );
+      assert.isTrue(Exit.isFailure(failed));
+      assert.equal((yield* owner.readTask()).status, "launching");
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      yield* executor.execute(owner.input);
+      assert.equal((yield* owner.readTask()).status, "running");
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      assert.equal((yield* threads.getThreadProjection(owner.task.workerThreadId)).runs.length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("recovers the initial worker run even after later coordinator and worker turns", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch();
+    yield* owner.start();
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(owner.workerInput);
+    const initialId = launched.projection.runs[0]!.id;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    for (const threadId of [owner.input.threadId, owner.task.workerThreadId]) {
+      yield* threads.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`later:${threadId}`),
+        threadId,
+        messageId: MessageId.make(`later:${threadId}`),
+        text: "Later turn",
+        attachments: [],
+        modelSelection,
+        multiAgent: { mode: "off" },
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "queue_after_active" },
+      });
+    }
+    const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+    yield* executor.execute(owner.input);
+    const task = yield* owner.readTask();
+    assert.equal(task.status, "running");
+    assert.equal("workerRunId" in task ? task.workerRunId : undefined, initialId);
+    const workerRuns = (yield* threads.getThreadProjection(owner.task.workerThreadId)).runs;
+    assert.equal(workerRuns.length, 2);
+    assert.isDefined(workerRuns[0]?.controlledWorkerOwnership);
+    assert.isUndefined(workerRuns[1]?.controlledWorkerOwnership);
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    assert.isTrue(
+      yield* projections.controlledWorkerStartAllowed(
+        owner.task.workerThreadId,
+        workerRuns[1]!.id,
+        workerRuns[1]!.activeAttemptId!,
+      ),
+    );
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "replays an unsettled outbox launch after process loss without creating another worker",
+  () => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      yield* owner.start();
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      let claimedLaunch = false;
+      // Other effects are provider boundaries, deliberately stubbed in this test.
+      while (!claimedLaunch) {
+        const claim = yield* outbox.claimNext({
+          workerId: "lost-process",
+          leaseDurationMs: 30_000,
+        });
+        assert.isTrue(Option.isSome(claim));
+        if (Option.isNone(claim)) return;
+        if (claim.value.request.type === "multi-agent.worker.launch") {
+          yield* executor.execute(owner.input);
+          claimedLaunch = true;
+          // Simulate process loss after acknowledgment, before outbox.succeed.
+        } else yield* outbox.succeed({ effectId: claim.value.id, workerId: "lost-process" });
+      }
+      assert.isAtLeast((yield* outbox.reconcileAfterProcessLoss).requeued, 1);
+      const layerWorker = EffectWorker.layerWithOptions({ workerId: "restarted-process" }).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+            Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+              execute: (effect) =>
+                effect.request.type === "multi-agent.worker.launch"
+                  ? executor
+                      .execute({
+                        threadId: effect.threadId,
+                        coordinatorRunId: effect.request.coordinatorRunId,
+                        taskId: effect.request.taskId,
+                        launchCommandId: effect.request.launchCommandId,
+                      })
+                      .pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new EffectWorker.OrchestrationEffectExecutionError({
+                              effectId: effect.id,
+                              effectType: effect.request.type,
+                              cause,
+                            }),
+                        ),
+                      )
+                  : Effect.void,
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* worker.drain();
+      }).pipe(Effect.provide(layerWorker));
+      const effect = (yield* outbox.listByCommandId(
+        CommandId.make("controller:launch-request"),
+      ))[0]!;
+      assert.equal(effect.status, "succeeded");
+      assert.isAtLeast(effect.attemptCount, 2);
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      assert.equal((yield* threads.getThreadProjection(owner.task.workerThreadId)).runs.length, 1);
+      assert.equal((yield* owner.readTask()).status, "running");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("retains cancellation capacity and records an already-created exact worker run", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch();
+    yield* owner.start();
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const launched = yield* launches.launch(owner.workerInput);
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "multi-agent.controller.command",
+      commandId: CommandId.make("controller:cancel"),
+      threadId: owner.input.threadId,
+      runId: owner.run.id,
+      action: { type: "cancel" },
+    });
+    const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+    yield* executor.execute(owner.input);
+    const task = yield* owner.readTask();
+    assert.equal(task.status, "cancellation_pending");
+    assert.equal(
+      "workerRunId" in task ? task.workerRunId : undefined,
+      launched.projection.runs[0]!.id,
+    );
+    const rejected = yield* orchestrator
+      .dispatch({
+        type: "multi-agent.controller.command",
+        commandId: CommandId.make("controller:unsafe-release"),
+        threadId: owner.input.threadId,
+        runId: owner.run.id,
+        action: {
+          type: "launch_failed",
+          taskId: task.taskId,
+          launchCommandId: task.launchCommandId,
+        },
+      })
+      .pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(rejected));
+    assert.equal((yield* owner.readTask()).status, "cancellation_pending");
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "releases capacity for a verified selection rejection at the thread launch boundary",
+  () => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      yield* owner.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const rejected = {
+        ...launches,
+        launch: (input: ThreadLaunch.ThreadLaunchInput) =>
+          new ThreadLaunch.ThreadLaunchError({
+            commandId: input.commandId,
+            projectId: input.projectId,
+            operation: "validate-model-selection",
+            selectionIssue: { reason: "provider_unavailable" },
+            cause: "Catalog changed before create",
+          }),
+      };
+      yield* Effect.gen(function* () {
+        const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+        yield* executor.execute(owner.input);
+      }).pipe(
+        Effect.provide(
+          Layer.fresh(MultiAgentWorkerLaunchService.layer).pipe(
+            Layer.provide(Layer.succeed(ThreadLaunch.ThreadLaunchService, rejected)),
+          ),
+        ),
+      );
+      assert.equal((yield* owner.readTask()).status, "failed");
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("retains a partial launch slot when the catalog becomes unavailable", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch();
+    yield* owner.start();
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const { initialMessage: _message, ...createOnly } = owner.workerInput;
+    yield* launches.launch(createOnly);
+    const result = yield* Effect.gen(function* () {
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      yield* executor.execute(owner.input);
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(MultiAgentWorkerLaunchService.layer).pipe(
+          Layer.provide(ProviderRegistryMock.layer([])),
+        ),
+      ),
+      Effect.exit,
+    );
+    assert.isTrue(Exit.isFailure(result));
+    assert.equal((yield* owner.readTask()).status, "launching");
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    assert.equal((yield* threads.getThreadProjection(owner.task.workerThreadId)).runs.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "binds worker acknowledgments to the completed originating run and exact launch identities",
+  () => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const owner = yield* seedControlledLaunch();
+      const sink = yield* EventSink.EventSinkV2;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("controller:completed"),
+            type: "run.updated",
+            threadId: owner.input.threadId,
+            runId: owner.run.id,
+            occurredAt: yield* DateTime.now,
+            payload: { ...owner.run, status: "completed", completedAt: yield* DateTime.now },
+          },
+        ],
+      });
+      yield* owner.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const launched = yield* launches.launch(owner.workerInput);
+      const action = {
+        type: "started" as const,
+        taskId: owner.task.taskId,
+        launchCommandId: owner.task.launchCommandId,
+        workerThreadId: owner.task.workerThreadId,
+        workerRunId: launched.projection.runs[0]!.id,
+      };
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const wrong = [
+        { ...action, launchCommandId: CommandId.make("foreign:launch") },
+        { ...action, workerThreadId: ThreadId.make("foreign:thread") },
+        { ...action, workerRunId: RunId.make("foreign:run") },
+      ];
+      for (const [index, attempt] of wrong.entries()) {
+        const exit = yield* orchestrator
+          .dispatch({
+            type: "multi-agent.controller.command",
+            commandId: CommandId.make(`wrong:ack:${index}`),
+            threadId: owner.input.threadId,
+            runId: owner.run.id,
+            action: attempt,
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(exit));
+      }
+      assert.equal((yield* owner.readTask()).status, "launching");
+      const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+      yield* executor.execute(owner.input);
+      const task = yield* owner.readTask();
+      assert.equal(task.status, "running");
+      assert.equal("workerRunId" in task ? task.workerRunId : undefined, action.workerRunId);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("refuses a launch command receipt belonging to another thread", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch();
+    yield* owner.start();
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    yield* launches.launch({
+      ...launchInput({ command: owner.task.launchCommandId, thread: "foreign:worker" }),
+    });
+    const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+    const exit = yield* executor.execute(owner.input).pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(exit));
+    assert.equal((yield* owner.readTask()).status, "launching");
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("rejects stale reservation and mismatched task/run/launch identity", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const owner = yield* seedControlledLaunch();
+    const executor = yield* MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService;
+    for (const input of [
+      owner.input,
+      { ...owner.input, coordinatorRunId: RunId.make("foreign") },
+      { ...owner.input, taskId: NodeId.make("foreign") },
+      { ...owner.input, launchCommandId: CommandId.make("foreign") },
+    ])
+      assert.isTrue(Exit.isFailure(yield* executor.execute(input).pipe(Effect.exit)));
+    assert.equal((yield* owner.readTask()).status, "reserved");
+    yield* owner.start();
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    yield* orchestrator.dispatch({
+      type: "multi-agent.controller.command",
+      commandId: CommandId.make("controller:cancel"),
+      threadId: owner.input.threadId,
+      runId: owner.run.id,
+      action: { type: "cancel" },
+    });
+    yield* executor.execute(owner.input);
+    assert.equal((yield* owner.readTask()).status, "cancelled");
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    assert.isNull(yield* threads.getThreadShell(owner.task.workerThreadId));
+  }).pipe(Effect.provide(harness.layer));
+});
+
 it.effect("persists independent worker grouping without changing lineage", () => {
   const harness = makeHarness();
   return Effect.gen(function* () {
@@ -3063,5 +3859,243 @@ it.effect("persists independent worker grouping without changing lineage", () =>
         coordinator.threadId,
       );
     }).pipe(Effect.provide(ProjectionStore.layer));
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect(
+  "persists exact initial ownership before deferred workspace preparation and preserves duplicate receipts",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        providers: [launchCatalogProvider],
+        runSetup: (input) =>
+          input.threadId === ThreadId.make("controlled:worker")
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as({ status: "no-script" as const }),
+              )
+            : Effect.succeed({ status: "no-script" as const }),
+      });
+      yield* Effect.gen(function* () {
+        const fixture = yield* seedControlledLaunch();
+        yield* fixture.start();
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const first = yield* launches.launch(fixture.workerInput);
+        yield* Deferred.await(entered);
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const initial = (yield* threads.getThreadProjection(first.threadId)).runs[0]!;
+        const ownership = initial.controlledWorkerOwnership!;
+        assert.equal(initial.status, "preparing");
+        assert.deepEqual(ownership, {
+          ...fixture.workerInput.controlledWorkerLaunchOwner!,
+          workerRunId: initial.id,
+          workerAttemptId: initial.activeAttemptId,
+          providerInstanceId: initial.providerInstanceId,
+          providerThreadId: initial.providerThreadId,
+          providerSessionId: first.projection.providerThreads.find(
+            (row) => row.id === initial.providerThreadId,
+          )!.providerSessionId,
+        });
+        const retry = yield* launches.launch(fixture.workerInput);
+        assert.equal(retry.projection.runs.length, 1);
+        assert.deepEqual(retry.projection.runs[0]!.controlledWorkerOwnership, ownership);
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        assert.isTrue(
+          yield* projections.controlledWorkerStartAllowed(
+            first.threadId,
+            initial.id,
+            initial.activeAttemptId!,
+          ),
+        );
+        assert.isFalse(
+          yield* projections.controlledWorkerStartAllowed(
+            first.threadId,
+            initial.id,
+            RunAttemptId.make("stale-attempt"),
+          ),
+        );
+        const conflict = yield* launches
+          .launch({
+            ...fixture.workerInput,
+            controlledWorkerLaunchOwner: {
+              ...fixture.workerInput.controlledWorkerLaunchOwner!,
+              taskId: NodeId.make("other-task"),
+            },
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(conflict));
+        yield* Deferred.succeed(release, undefined);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect.each(["coordinatorRunId", "taskId", "workerThreadId", "launchMessageId"] as const)(
+  "rejects conflicting %s ownership before initial dispatch can start preparation",
+  (field) => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const fixture = yield* seedControlledLaunch();
+      yield* fixture.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const owner = fixture.workerInput.controlledWorkerLaunchOwner!;
+      const invalid = { ...owner, [field]: "mismatched-identity" };
+      const result = yield* launches
+        .launch({ ...fixture.workerInput, controlledWorkerLaunchOwner: invalid })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(result));
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const projection = yield* threads.getThreadProjection(fixture.task.workerThreadId);
+      assert.equal(projection.runs.length, 0);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect(
+  "fails closed for an older unowned controlled initial run without affecting ordinary launches",
+  () => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const fixture = yield* seedControlledLaunch();
+      yield* fixture.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const { controlledWorkerLaunchOwner: _owner, ...legacy } = fixture.workerInput;
+      const old = yield* launches.launch(legacy);
+      const run = old.projection.runs[0]!;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      assert.isFalse(
+        yield* projections.controlledWorkerStartAllowed(old.threadId, run.id, run.activeAttemptId!),
+      );
+      const recovery = yield* launches.launch(fixture.workerInput).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(recovery));
+      // Grouping is presentation metadata, not execution authority.
+      const sink = yield* EventSink.EventSinkV2;
+      const { coordinatorThreadId: _group, ...ungrouped } = old.projection.thread;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("legacy:ungrouped"),
+            type: "thread.metadata-updated",
+            threadId: old.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: ungrouped,
+          },
+        ],
+      });
+      assert.isFalse(
+        yield* projections.controlledWorkerStartAllowed(old.threadId, run.id, run.activeAttemptId!),
+      );
+      const ordinary = yield* launches.launch(
+        launchInput({
+          command: "ordinary-owner-test",
+          thread: "ordinary-owner-test",
+          message: "Ordinary turn",
+        }),
+      );
+      const ordinaryRun = ordinary.projection.runs[0]!;
+      assert.isUndefined(ordinaryRun.controlledWorkerOwnership);
+      assert.isTrue(
+        yield* projections.controlledWorkerStartAllowed(
+          ordinary.threadId,
+          ordinaryRun.id,
+          ordinaryRun.activeAttemptId!,
+        ),
+      );
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect(
+  "preserves immutable worker ownership through stale updates, SQL reload and event replay",
+  () => {
+    const harness = makeHarness({ providers: [launchCatalogProvider] });
+    return Effect.gen(function* () {
+      const fixture = yield* seedControlledLaunch();
+      yield* fixture.start();
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const worker = yield* launches.launch(fixture.workerInput);
+      const initial = worker.projection.runs[0]!;
+      const sink = yield* EventSink.EventSinkV2;
+      const { controlledWorkerOwnership: ownership, ...stale } = initial;
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("ownership:stale"),
+            type: "run.updated",
+            threadId: worker.threadId,
+            runId: initial.id,
+            occurredAt: yield* DateTime.now,
+            payload: stale,
+          },
+        ],
+      });
+      const conflict = yield* sink
+        .write({
+          events: [
+            {
+              id: EventId.make("ownership:conflict"),
+              type: "run.updated",
+              threadId: worker.threadId,
+              runId: initial.id,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...initial,
+                controlledWorkerOwnership: {
+                  ...ownership!,
+                  workerAttemptId: RunAttemptId.make("different-attempt"),
+                },
+              },
+            },
+          ],
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(conflict));
+      const events = yield* EventStore.EventStoreV2.pipe(Effect.provide(EventStore.layer));
+      const recorded = yield* events.read({}).pipe(Stream.runCollect);
+      for (const layer of [ProjectionStore.layerMemory, ProjectionStore.layer]) {
+        yield* Effect.gen(function* () {
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          if (layer === ProjectionStore.layerMemory)
+            for (const stored of recorded) yield* projections.apply(stored.event);
+          const persisted = (yield* projections.getThreadProjection(worker.threadId)).runs[0]!;
+          assert.deepEqual(persisted.controlledWorkerOwnership, ownership);
+          assert.isTrue(
+            yield* projections.controlledWorkerStartAllowed(
+              worker.threadId,
+              initial.id,
+              initial.activeAttemptId!,
+            ),
+          );
+          const conflictReplay = yield* projections
+            .apply({
+              id: EventId.make("ownership:replay-conflict"),
+              type: "run.updated",
+              threadId: worker.threadId,
+              runId: initial.id,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...initial,
+                controlledWorkerOwnership: { ...ownership!, taskId: NodeId.make("wrong-task") },
+              },
+            })
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(conflictReplay));
+        }).pipe(Effect.provide(layer));
+      }
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect("rejects ownership without a persisted launch authorization", () => {
+  const harness = makeHarness({ providers: [launchCatalogProvider] });
+  return Effect.gen(function* () {
+    const fixture = yield* seedControlledLaunch();
+    // Still reserved: no launch command has committed.
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const result = yield* launches.launch(fixture.workerInput).pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(result));
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    assert.equal((yield* threads.getThreadProjection(fixture.task.workerThreadId)).runs.length, 0);
   }).pipe(Effect.provide(harness.layer));
 });

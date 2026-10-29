@@ -39,9 +39,14 @@ import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+
+const layerRuntimeWithoutControllerLaunch = RuntimeLayer.layer.pipe(
+  Layer.provide(Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)({})),
+);
 
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
@@ -104,7 +109,10 @@ const layerTestProviderInstanceRegistry = Layer.succeed(
   },
 );
 
-const layerTest = Layer.mergeAll(RuntimeLayer.layer, RuntimeLayer.layerEventSink).pipe(
+const layerTest = Layer.mergeAll(
+  layerRuntimeWithoutControllerLaunch,
+  RuntimeLayer.layerEventSink,
+).pipe(
   Layer.provideMerge(RuntimeLayer.layerProjectService),
   Layer.provide(
     Layer.mock(WorkspacePaths.WorkspacePaths)({

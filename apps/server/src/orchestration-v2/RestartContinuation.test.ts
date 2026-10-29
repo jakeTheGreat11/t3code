@@ -129,6 +129,22 @@ it("requires matching saved native state for an unfinished root run", () => {
     assert.isUndefined(restartContinuationRun(invalid as OrchestrationV2ThreadProjection, now));
 });
 
+it("never schedules restart recovery for a controlled Codex initial run or its legacy follow-up", () => {
+  const projection = makeProjection();
+  const initial = {
+    ...projection.runs[0]!,
+    controlledWorkerOwnership: { providerThreadId },
+  } as OrchestrationV2ThreadProjection["runs"][number];
+  assert.isUndefined(restartContinuationRun({ ...projection, runs: [initial] }, now));
+  const followup = {
+    ...projection.runs[0]!,
+    id: RunId.make("legacy-automatic-followup"),
+    ordinal: 2,
+    restartContinuationOfRunId: initial.id,
+  };
+  assert.isUndefined(restartContinuationRun({ ...projection, runs: [initial, followup] }, now));
+});
+
 it("continues a live turn whose session the adapter never marked running", () => {
   const projection = makeProjection();
   // Codex, Claude, Cursor and ACP sessions stay "ready" for their whole life.

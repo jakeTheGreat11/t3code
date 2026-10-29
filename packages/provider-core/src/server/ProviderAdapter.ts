@@ -1,4 +1,7 @@
-import type { OrchestrationV2HistoricalMessage } from "@t3tools/contracts";
+import type {
+  ContinuationEmitterIdentity,
+  OrchestrationV2HistoricalMessage,
+} from "@t3tools/contracts";
 import {
   ChatAttachment,
   CheckpointId,
@@ -532,6 +535,8 @@ export interface ProviderAdapterV2McpApps {
 }
 
 export interface ProviderAdapterV2SessionRuntime {
+  /** Observable construction identity; legacy runtimes may not advertise it. */
+  readonly continuationEmitterIdentity?: ContinuationEmitterIdentity;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;

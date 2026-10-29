@@ -540,6 +540,8 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly relatedProviderThreadIds?: ReadonlyArray<ProviderThreadId>;
   readonly shouldStartProviderTurn?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  /** Bound by the server turn-start path, never by provider/model arguments. */
+  readonly onTaskProposal?: (itemId: TurnItemId) => Effect.Effect<void>;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly message: ProviderAdapter.ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
@@ -1277,6 +1279,23 @@ export const layer: Layer.Layer<
                       : {}),
                   });
                   storedEventCount = storedEvents.length;
+                  if (
+                    input.onTaskProposal &&
+                    deliveredEvent.type === "turn_item.updated" &&
+                    deliveredEvent.driver === "codex" &&
+                    deliveredEvent.turnItem.type === "assistant_message" &&
+                    deliveredEvent.turnItem.threadId === input.run.threadId &&
+                    deliveredEvent.turnItem.runId === input.run.id &&
+                    deliveredEvent.turnItem.providerThreadId === input.providerThread.id &&
+                    deliveredEvent.turnItem.providerTurnId ===
+                      (yield* Ref.get(eventRouting)).rootProviderTurnId &&
+                    deliveredEvent.turnItem.status === "completed" &&
+                    !deliveredEvent.turnItem.streaming &&
+                    deliveredEvent.turnItem.text.trimStart().startsWith("{") &&
+                    /"tasks"\s*:/.test(deliveredEvent.turnItem.text) &&
+                    storedEventCount > 0
+                  )
+                    yield* input.onTaskProposal(deliveredEvent.turnItem.id);
                   if (
                     isRootProviderThreadUpdate &&
                     rootTerminalAlreadySeen &&

@@ -1,4 +1,6 @@
 import * as Option from "effect/Option";
+import type { MultiAgentControllerState } from "@t3tools/contracts";
+
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
@@ -68,6 +70,30 @@ import {
 } from "../providerInstances";
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
+
+/** Later manual turns stay independent of an earlier coordinator's Stop control. */
+export function stoppableCoordinatorRunId(
+  runs: ReadonlyArray<{
+    id: RunId;
+    ordinal: number;
+    multiAgentReview?: { coordinatorRunId: RunId } | undefined;
+    multiAgentController?:
+      | Pick<MultiAgentControllerState, "status" | "coordinatorStoppedAt">
+      | undefined;
+  }>,
+) {
+  const latest = runs.reduce<(typeof runs)[number] | undefined>(
+    (current, run) => (!current || run.ordinal > current.ordinal ? run : current),
+    undefined,
+  );
+  const owner = latest?.multiAgentReview
+    ? runs.find((run) => run.id === latest.multiAgentReview?.coordinatorRunId)
+    : latest;
+  return owner?.multiAgentController?.status === "open" &&
+    owner.multiAgentController.coordinatorStoppedAt === undefined
+    ? latest?.id
+    : undefined;
+}
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 
 export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;

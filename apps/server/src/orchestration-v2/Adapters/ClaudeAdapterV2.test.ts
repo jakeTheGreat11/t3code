@@ -6128,6 +6128,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.offer(harness.sdkMessages, wakeAssistant);
         yield* awaitUntil(() => harness.continuationRequests.length === 1, "continuation request");
         assert.equal(harness.continuationRequests[0]?.threadId, harness.threadId);
+        assert.deepEqual(
+          harness.continuationRequests[0]?.emitterIdentity,
+          harness.runtime.continuationEmitterIdentity,
+        );
+        assert.equal(harness.continuationRequests[0]?.emitterIdentity?.type, "known");
+        assert.deepInclude(harness.continuationRequests[0]?.emitterIdentity, {
+          type: "known",
+          providerInstanceId: harness.runtime.instanceId,
+          providerSessionId: harness.runtime.providerSessionId,
+        });
         assert.equal(harness.continuationRequests[0]?.providerThreadId, harness.providerThread.id);
         assert.equal(harness.continuationRequests[0]?.driver, ClaudeAdapterV2.CLAUDE_PROVIDER);
         assert.equal(harness.continuationRequests[0]?.detail, WAKE_SUMMARY);

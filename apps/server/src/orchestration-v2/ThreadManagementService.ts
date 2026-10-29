@@ -331,6 +331,7 @@ export interface ThreadManagementServiceShape {
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly scheduleMultiAgentWorkers: Orchestrator.OrchestratorV2["Service"]["scheduleMultiAgentWorkers"];
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -951,6 +952,25 @@ const make = Effect.gen(function* () {
           runId: input.runId,
         });
       }
+      const interruptibleRun = latestActiveRun(target);
+      // Commit the admission/submission barrier before stopping coordinator execution,
+      // including when its own provider run has already finished but workers remain.
+      const execution = explicitRun ?? interruptibleRun ?? latestRun(target);
+      const coordinator = execution?.multiAgentReview
+        ? target.runs.find((run) => run.id === execution.multiAgentReview?.coordinatorRunId)
+        : execution;
+      if (
+        coordinator?.multiAgentController !== undefined &&
+        coordinator.multiAgentController.coordinatorStoppedAt === undefined
+      ) {
+        yield* orchestrator.dispatch({
+          type: "multi-agent.controller.command",
+          commandId: CommandId.make(`${input.commandId}:stop-coordinator:${coordinator.id}`),
+          threadId: input.threadId,
+          runId: coordinator.id,
+          action: { type: "stop_coordinator" },
+        });
+      }
       if (explicitRun !== undefined && isTerminalRunStatus(explicitRun.status)) {
         return {
           type: "already_terminal",
@@ -959,7 +979,6 @@ const make = Effect.gen(function* () {
           },
         } as const;
       }
-      const interruptibleRun = latestActiveRun(target);
       if (interruptibleRun === undefined) {
         if (input.runId === undefined) {
           return { type: "no_active_run" } as const;
@@ -1134,6 +1153,7 @@ const make = Effect.gen(function* () {
         Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
       ),
     getThreadProjection,
+    scheduleMultiAgentWorkers: orchestrator.scheduleMultiAgentWorkers,
     getCheckpointContext,
     getThreadSnapshot,
     getThreadSnapshotWindow,

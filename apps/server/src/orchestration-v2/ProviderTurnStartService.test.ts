@@ -36,7 +36,122 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import { ControlledWorkerExecutionDisabled } from "./ControlledWorkerSubmission.ts";
+
+effectIt.effect.each([
+  "uncertain-commitment",
+  "stale-attempt",
+  "native-goal",
+  "legacy-followup",
+  "unsupported-binding",
+  "missing-catalog",
+])("does not even reopen a Codex runtime for %s controlled work", (kind) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("controlled-recovery-worker");
+    const runId = RunId.make("controlled-recovery-initial");
+    const attemptId = RunAttemptId.make("controlled-recovery-attempt");
+    const owner = {
+      coordinatorThreadId: ThreadId.make("coordinator"),
+      coordinatorRunId: RunId.make("coordinator-run"),
+      taskId: NodeId.make("controller-task"),
+      workerAttemptId: attemptId,
+      providerThreadId: ProviderThreadId.make("controlled-binding"),
+    };
+    const projection = {
+      runs: [
+        {
+          id: kind === "legacy-followup" ? RunId.make("older-owned-initial") : runId,
+          status: "starting",
+          userMessageId: MessageId.make("initial"),
+          activeAttemptId: kind === "stale-attempt" ? RunAttemptId.make("replacement") : attemptId,
+          controlledWorkerOwnership: owner,
+        },
+        ...(kind === "legacy-followup"
+          ? [{ id: runId, status: "starting", userMessageId: MessageId.make("initial") }]
+          : []),
+      ],
+      providerThreads: [
+        {
+          id: owner.providerThreadId,
+          driver: kind === "unsupported-binding" ? "scripted-other" : "codex",
+        },
+      ],
+      messages: [
+        {
+          id: "initial",
+          text: kind === "native-goal" ? "/goal build a DJ app" : "Build the frontend",
+          createdBy: "agent",
+          creationSource: "server",
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const open = vi.fn(() => Effect.die("must not reopen provider runtime"));
+    const startRootRun = vi.fn(() => Effect.die("must not submit"));
+    const layer = ProviderTurnStart.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(ControlledWorkerExecutionDisabled, false),
+          Layer.mock(Orchestrator.OrchestratorV2)({}),
+          Layer.mock(EventSink.EventSinkV2)({}),
+          Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+          IdAllocator.layer,
+          FileSystem.layerNoop({}),
+          Layer.mock(GitWorkflow.GitWorkflowService)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(ProviderAuthService.ProviderAuthService)({}),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            controlledWorkerStartAllowed: () => Effect.succeed(true),
+            getTurnStartContext: () => Effect.succeed({ ...projection, hasConversation: false }),
+            getThreadRecords: () =>
+              Effect.succeed({
+                runs: [
+                  {
+                    id: owner.coordinatorRunId,
+                    multiAgentController: {
+                      tasks: [
+                        {
+                          taskId: owner.taskId,
+                          ...(kind === "uncertain-commitment" ? { submissionCommitment: {} } : {}),
+                        },
+                      ],
+                    },
+                  },
+                ],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
+          Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
+          Layer.mock(RuntimePolicy.RuntimePolicyV2)({}),
+        ),
+      ),
+    );
+    for (let delivery = 0; delivery < 2; delivery++) {
+      const result = yield* Effect.exit(
+        Effect.gen(function* () {
+          const starts = yield* ProviderTurnStart.ProviderTurnStartServiceV2;
+          yield* starts.start({ threadId, runId, willRetry: true });
+        }).pipe(Effect.provide(layer)),
+      );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure")
+        expect(String(result.cause)).toContain(
+          kind === "legacy-followup"
+            ? "cannot execute automatic follow-up"
+            : kind === "unsupported-binding"
+              ? "verified Codex binding"
+              : kind === "missing-catalog"
+                ? "catalog or coordinator is unavailable"
+                : kind === "native-goal"
+                  ? "Native Codex goals"
+                  : "already committed or its ownership is stale",
+        );
+    }
+    expect(open).not.toHaveBeenCalled();
+    expect(startRootRun).not.toHaveBeenCalled();
+  }),
+);
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
 
@@ -92,6 +207,7 @@ it("does not commit running state when inherited background routing cannot be re
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(Orchestrator.OrchestratorV2)({}),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -171,6 +287,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   /** Loads the thread and starts the run, then fails every later state read. */
   readonly failReadsAfterRunning?: boolean;
+  readonly controlledInitialOwnershipAllowed?: boolean;
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -342,6 +459,13 @@ function makeLocalCommandHarness(input: {
     checkpoints: [],
     updatedAt: now,
   };
+  if (input.controlledInitialOwnershipAllowed !== undefined) {
+    projection = {
+      ...projection,
+      thread: { ...projection.thread, coordinatorThreadId: ThreadId.make("controller") },
+      runs: projection.runs.map((candidate) => ({ ...candidate, ordinal: 1 })),
+    };
+  }
   if ("historyReadFailureAfterFallback" in input) {
     const nativeThreadRef = {
       driver: providerThread.driver,
@@ -486,6 +610,7 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(Orchestrator.OrchestratorV2)({}),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
@@ -495,6 +620,8 @@ function makeLocalCommandHarness(input: {
         Layer.mock(GitWorkflow.GitWorkflowService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          controlledWorkerStartAllowed: () =>
+            Effect.succeed(input.controlledInitialOwnershipAllowed ?? true),
           getTurnStartContext: () =>
             Effect.succeed({
               ...projection,
@@ -855,3 +982,17 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect("blocks an unowned controlled initial run before opening a provider session", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Do the worker task",
+      controlledInitialOwnershipAllowed: false,
+    });
+    yield* harness.start;
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.events).toHaveLength(0);
+    expect(harness.projection().runs[0]?.status).toBe("starting");
+  }),
+);

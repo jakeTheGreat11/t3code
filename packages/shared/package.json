@@ -47,6 +47,14 @@
       "types": "./src/multiAgentRouting.ts",
       "import": "./src/multiAgentRouting.ts"
     },
+    "./automaticContinuation": {
+      "types": "./src/automaticContinuation.ts",
+      "import": "./src/automaticContinuation.ts"
+    },
+    "./multiAgentController": {
+      "types": "./src/multiAgentController.ts",
+      "import": "./src/multiAgentController.ts"
+    },
     "./advertisedEndpoint": {
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"

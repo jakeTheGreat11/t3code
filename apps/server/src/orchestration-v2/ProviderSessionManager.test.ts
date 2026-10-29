@@ -4,6 +4,12 @@ import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
   EnvironmentId,
+  CommandId,
+  MessageId,
+  NodeId,
+  RunId,
+  RunAttemptId,
+  ProviderThreadId,
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
@@ -51,6 +57,7 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeContinuationEmitter } from "@t3tools/provider-core/server/ProviderContinuationRequests";
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
 const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
@@ -328,6 +335,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const emitter = yield* makeContinuationEmitter(ProviderInstanceId.make("codex"));
   const countClose = Effect.addFinalizer(() =>
     Ref.update(state, (current) => ({
       ...current,
@@ -350,6 +358,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: (input) =>
       Effect.gen(function* () {
+        const sessionEmitter = yield* emitter.forSession(input.providerSessionId);
         if (options.spawnBeforeOpen === true) {
           yield* countClose;
           if (options.hangSessionScopeClose === true) yield* hangClose;
@@ -387,6 +396,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
         }
 
         return {
+          continuationEmitterIdentity: sessionEmitter.identity,
           instanceId: ProviderInstanceId.make("codex"),
           driver: CODEX_DRIVER,
           providerSessionId: input.providerSessionId,
@@ -795,6 +805,165 @@ function makePendingRuntimeRequestEvents(input: {
     return { events, providerEvents, requestId, nodeId };
   });
 }
+
+it.effect(
+  "registers the exact runtime before publication, and shared/manual attachments preserve exposure",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const now = yield* DateTime.now;
+        const worker = ThreadId.make("exposure-worker");
+        const manual = ThreadId.make("exposure-manual");
+        const sessionId = ids.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: worker, now }),
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: manual, now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId: worker,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.deepEqual(
+          yield* manager.validateContinuationEmitter(runtime.continuationEmitterIdentity),
+          { status: "verified", bindingExposure: "unexposed" },
+        );
+        const owner = {
+          coordinatorThreadId: ThreadId.make("coordinator"),
+          coordinatorRunId: RunId.make("coordinator-run"),
+          taskId: NodeId.make("task"),
+          workerThreadId: worker,
+          workerRunId: RunId.make("worker-run"),
+          workerAttemptId: RunAttemptId.make("worker-attempt"),
+          launchCommandId: CommandId.make("launch"),
+          launchMessageId: MessageId.make("message"),
+          providerInstanceId: runtime.instanceId,
+          providerSessionId: sessionId,
+          providerThreadId: ProviderThreadId.make("worker-provider-thread"),
+        };
+        assert.equal(
+          (yield* manager.markControlledWorkerExposure({ ...runtime }, owner).pipe(Effect.exit))
+            ._tag,
+          "Failure",
+        );
+        yield* manager.markControlledWorkerExposure(runtime, owner);
+        yield* manager.markControlledWorkerExposure(runtime, owner);
+        const shared = yield* manager.open({
+          threadId: manual,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.strictEqual(shared, runtime);
+        assert.deepEqual(
+          yield* manager.validateContinuationEmitter(shared.continuationEmitterIdentity),
+          { status: "verified", bindingExposure: "controlled_worker" },
+        );
+        yield* manager.close(sessionId);
+        assert.deepEqual(
+          yield* manager.validateContinuationEmitter(runtime.continuationEmitterIdentity),
+          { status: "retired", bindingExposure: "controlled_worker" },
+        );
+        const reopened = yield* manager.open({
+          threadId: manual,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.notDeepEqual(
+          reopened.continuationEmitterIdentity,
+          runtime.continuationEmitterIdentity,
+        );
+        assert.equal(
+          (yield* manager.validateContinuationEmitter(reopened.continuationEmitterIdentity))
+            .bindingExposure,
+          "controlled_worker",
+        );
+        assert.equal(
+          (yield* manager.validateContinuationEmitter(runtime.continuationEmitterIdentity)).status,
+          "retired",
+        );
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            capabilities: {
+              ...CodexCapabilities,
+              sessions: {
+                ...CodexCapabilities.sessions,
+                supportsMultipleProviderThreadsPerSession: true,
+              },
+            },
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "reopening a historical session from an unrelated thread cannot establish non-exposure",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const first = ThreadId.make("history-first-thread");
+        const later = ThreadId.make("history-later-thread");
+        const sessionId = ids.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: first, now }),
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId: later, now }),
+          ],
+        });
+        const original = yield* manager.open({
+          threadId: first,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(
+          (yield* manager.validateContinuationEmitter(original.continuationEmitterIdentity))
+            .bindingExposure,
+          "unexposed",
+        );
+        yield* manager.close(sessionId);
+        assert.isEmpty(
+          (yield* projections.getThreadRecords(later, ["providerSessions"])).providerSessions,
+        );
+        const reopened = yield* manager.open({
+          threadId: later,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.deepEqual(
+          yield* manager.validateContinuationEmitter(reopened.continuationEmitterIdentity),
+          { status: "verified", bindingExposure: "unknown" },
+        );
+        assert.deepEqual(
+          yield* manager.validateContinuationEmitter(original.continuationEmitterIdentity),
+          { status: "retired", bindingExposure: "unknown" },
+        );
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
+    }),
+);
 
 it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", () =>
   Effect.gen(function* () {

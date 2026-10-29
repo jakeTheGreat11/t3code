@@ -851,6 +851,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   const host = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+  const continuationEmitter = yield* ProviderContinuationRequests.makeContinuationEmitter(
+    instanceId,
+    continuationRequests,
+  );
   const crypto = yield* Crypto.Crypto;
   const driver = OPENCODE_PROVIDER;
   const mcpServerNameFor = (threadId: string) =>
@@ -886,6 +890,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     let connection = initial.connection;
     // Replaced when the session reconnects to a restarted server.
     let client = connection.client;
+    const sessionEmitter = yield* continuationEmitter.forSession(input.providerSessionId);
     const sessionScope = yield* Effect.scope;
     // Context windows by directory, then `provider/model`: a project's own
     // OpenCode config can change a model's limits, and this one runtime serves
@@ -1702,7 +1707,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const route = state.providerThread.appThreadId;
       if (route === null || wake.messageId === undefined) return;
       const notification = backgroundWorkNotification(wake.reports);
-      yield* continuationRequests.offer({
+      yield* sessionEmitter.offer({
         threadId: route,
         providerThreadId: state.providerThread.id,
         driver,
@@ -3759,6 +3764,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      continuationEmitterIdentity: sessionEmitter.identity,
       instanceId,
       driver,
       providerSessionId: input.providerSessionId,

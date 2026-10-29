@@ -499,6 +499,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
   const host = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { continuationRequests } = options;
+  const continuationEmitter = yield* ProviderContinuationRequests.makeContinuationEmitter(
+    options.instanceId,
+    continuationRequests,
+  );
 
   const protocolError = (detail: string, payload?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
@@ -516,6 +520,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       const scope = yield* Effect.scope;
+      const sessionEmitter = yield* continuationEmitter.forSession(input.providerSessionId);
       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
       const mcpSession = yield* mcpSessions.read(input.threadId);
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
@@ -1799,7 +1804,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 return;
               }
               yield* updateProviderSession("running", null);
-              yield* continuationRequests
+              yield* sessionEmitter
                 .offer({
                   threadId: state.providerThread.appThreadId,
                   providerThreadId: state.providerThread.id,
@@ -2512,6 +2517,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       });
 
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+        continuationEmitterIdentity: sessionEmitter.identity,
         instanceId: options.instanceId,
         driver: PI_PROVIDER,
         providerSessionId: input.providerSessionId,

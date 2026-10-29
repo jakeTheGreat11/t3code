@@ -7,8 +7,13 @@ import {
   MessageId,
   ProjectId,
   RunId,
+  RunAttemptId,
+  ProviderInstanceId,
   ThreadId,
+  type OrchestrationV2Run,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import { automaticCoordinatorReview } from "./MultiAgentDelegation";
 import {
   act,
   createRef,
@@ -429,6 +434,145 @@ function buildProps() {
     onManualNavigation: () => {},
   };
 }
+
+it("presents only registered server review input as diagnostics across hydration and remount", async () => {
+  vi.unstubAllGlobals();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("requestAnimationFrame", () => 0);
+  vi.stubGlobal("cancelAnimationFrame", () => {});
+  const entry = buildUserTimelineEntry("Review the exact worker results: internal instructions");
+  const threadId = ThreadId.make("coordinator-thread");
+  const review: OrchestrationV2Run = {
+    id: RunId.make("review-run"),
+    threadId,
+    ordinal: 2,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "catalog-model" },
+    providerThreadId: null,
+    userMessageId: entry.message.id,
+    rootNodeId: null,
+    activeAttemptId: RunAttemptId.make("review-attempt"),
+    status: "running",
+    requestedAt: DateTime.makeUnsafe("2026-10-15T00:00:00Z"),
+    startedAt: null,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+    multiAgentReview: { coordinatorRunId: RunId.make("original-run") },
+  };
+  const coordinator: OrchestrationV2Run = {
+    ...review,
+    id: RunId.make("original-run"),
+    ordinal: 1,
+    userMessageId: MessageId.make("original-goal"),
+    status: "completed",
+    multiAgentReview: undefined,
+    multiAgentController: {
+      coordinatorThreadId: threadId,
+      coordinatorRunId: RunId.make("original-run"),
+      status: "open",
+      tasks: [],
+      reviews: [{ runId: review.id, attemptId: review.activeAttemptId!, taskIds: [] }],
+    },
+  };
+  const message = {
+    ...entry.message,
+    runId: review.id,
+    createdBy: "agent" as const,
+    creationSource: "server" as const,
+  };
+  const runs = [coordinator, review];
+  expect(automaticCoordinatorReview(runs, message)?.coordinator.id).toBe(coordinator.id);
+  // Text, server attribution, and even a run link alone are insufficient.
+  expect(automaticCoordinatorReview(runs, { ...message, createdBy: "user" })).toBeUndefined();
+  expect(automaticCoordinatorReview(runs, { ...message, creationSource: "web" })).toBeUndefined();
+  expect(
+    automaticCoordinatorReview(runs, { ...message, id: MessageId.make("real-user") }),
+  ).toBeUndefined();
+  expect(automaticCoordinatorReview([review], message)).toBeUndefined();
+  expect(
+    automaticCoordinatorReview(
+      [
+        {
+          ...coordinator,
+          multiAgentController: { ...coordinator.multiAgentController!, reviews: [] },
+        },
+        review,
+      ],
+      message,
+    ),
+  ).toBeUndefined();
+  expect(
+    automaticCoordinatorReview(
+      [coordinator, { ...review, threadId: ThreadId.make("other") }],
+      message,
+    ),
+  ).toBeUndefined();
+  const userEntry = buildUserTimelineEntry(message.text);
+  const assistantEntry = buildAssistantTimelineEntry("Reviewed and verified the combined results.");
+  const timelineEntries = [
+    { ...entry, message },
+    {
+      ...userEntry,
+      id: "manual-entry",
+      message: {
+        ...userEntry.message,
+        id: MessageId.make("real-user"),
+        runId: review.id,
+        createdBy: "user" as const,
+      },
+    },
+    {
+      ...assistantEntry,
+      id: "assistant-entry",
+      message: { ...assistantEntry.message, id: MessageId.make("final-answer") },
+    },
+  ];
+  const container = document.createElement("div");
+  document.body.append(container);
+  let root = createRoot(container);
+  const render = (controllerRuns: readonly OrchestrationV2Run[]) =>
+    root.render(
+      <MessagesTimeline
+        {...buildProps()}
+        controllerRuns={controllerRuns}
+        timelineEntries={timelineEntries}
+      />,
+    );
+  try {
+    await act(async () => render([]));
+    expect(container.querySelector("details summary")?.textContent ?? "").not.toContain(
+      "Automatic coordinator review",
+    );
+    await act(async () => render(runs));
+    const assertPresentation = () => {
+      const disclosure = [...container.querySelectorAll("details")].find((node) =>
+        node.querySelector("summary")?.textContent?.includes("Automatic coordinator review"),
+      );
+      expect(disclosure).toBeDefined();
+      expect(disclosure!.open).toBe(false);
+      expect(disclosure!.querySelector("pre")?.textContent).toBe(message.text);
+      expect(disclosure!.textContent).toContain(coordinator.id);
+      expect(disclosure!.textContent).toContain(review.id);
+      expect(disclosure!.querySelector("h3")).toBeNull();
+      // The genuine user prompt with identical text is still a normal chat row.
+      expect(
+        [...container.querySelectorAll("h3")].filter((node) => node.textContent === "You"),
+      ).toHaveLength(1);
+      expect(container.textContent).toContain("Reviewed and verified the combined results.");
+    };
+    assertPresentation();
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await act(async () => render(structuredClone(runs)));
+    assertPresentation();
+    expect(message.text).toBe(entry.message.text);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
 
 function buildLongUserMessageText(tail = "deep hidden detail only after expand") {
   return Array.from({ length: 9 }, (_, index) =>

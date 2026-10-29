@@ -4741,6 +4741,13 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(withLineage(thread));
       yield* Deferred.await(replyEnded);
       assert.lengthOf(offers, 1);
+      assert.deepEqual(offers[0]!.emitterIdentity, runtime.continuationEmitterIdentity);
+      assert.equal(offers[0]!.emitterIdentity?.type, "known");
+      assert.deepInclude(offers[0]?.emitterIdentity, {
+        type: "known",
+        providerInstanceId: runtime.instanceId,
+        providerSessionId: runtime.providerSessionId,
+      });
       // The user stops the thread before the reply's continuation runs.
       yield* runtime.interruptTurn({
         providerThread: thread,

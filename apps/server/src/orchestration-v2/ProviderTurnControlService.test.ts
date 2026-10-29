@@ -210,7 +210,10 @@ it.effect(
       const layerProjection = Layer.succeed(
         ProjectionStore.ProjectionStoreV2,
         ProjectionStore.ProjectionStoreV2.of({
+          hasProviderSessionHistory: () => Effect.die("unused hasProviderSessionHistory"),
           apply: () => Effect.void,
+          controlledWorkerStartAllowed: () => Effect.die("unused controlledWorkerStartAllowed"),
+          getMultiAgentControllerRuns: () => Effect.die("unused getMultiAgentControllerRuns"),
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
           getShellSnapshot: () => Effect.die("unused getShellSnapshot"),
           readShellSnapshot: () => Effect.die("unused readShellSnapshot"),
@@ -232,7 +235,7 @@ it.effect(
           getMessageCount: () => Effect.die("unused message count"),
           getNextTurnItemOrdinal: () => Effect.die("unused ordinal read"),
           getTurnItem: () => Effect.die("unused turn item read"),
-          getThreadRecords: () => Effect.die("unused record read"),
+          getThreadRecords: () => Ref.get(projection),
           getRuntimeRequest: () => Effect.die("unused getRuntimeRequest"),
           getRunningTurnContext: () => Effect.die("unused getRunningTurnContext"),
           getThreadProviderContext: () => Effect.die("unused getThreadProviderContext"),
@@ -265,6 +268,8 @@ it.effect(
       const layerSessionManager = Layer.succeed(
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
+          validateContinuationEmitter: () => Effect.die("unused validateContinuationEmitter"),
+          markControlledWorkerExposure: () => Effect.die("unused markControlledWorkerExposure"),
           shutdown: Effect.void,
           open: () => Effect.die("unused open"),
           get: (providerSessionId) =>
@@ -307,6 +312,32 @@ it.effect(
       assert.isTrue(Exit.isFailure(ordinaryInterrupt));
       assert.isTrue(Exit.isFailure(unrelatedRestart));
       assert.isNull(yield* Ref.get(interruptedThread));
+
+      yield* Ref.update(projection, (current) => ({
+        ...current,
+        runs: [
+          {
+            id: RunId.make("owned-initial-run"),
+            controlledWorkerOwnership: { workerAttemptId: attemptId, providerThreadId },
+          } as OrchestrationV2ThreadProjection["runs"][number],
+        ],
+      }));
+      const controlledRestart = yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        return yield* Effect.exit(
+          control.interruptAndAwaitTerminal({
+            threadId,
+            providerSessionId: oldSessionId,
+            replacementProviderSessionId: replacementSessionId,
+            providerThreadId,
+            providerTurnId,
+            interruptedAttemptId: attemptId,
+          }),
+        );
+      }).pipe(Effect.provide(layerControl));
+      assert.isTrue(Exit.isFailure(controlledRestart));
+      assert.isNull(yield* Ref.get(interruptedThread));
+      yield* Ref.update(projection, (current) => ({ ...current, runs: [] }));
 
       yield* Effect.gen(function* () {
         const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;

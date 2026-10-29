@@ -11,6 +11,8 @@ import {
   ProviderSessionId,
   ThreadId,
   type ProviderThreadId,
+  type ContinuationEmitterIdentity,
+  type MultiAgentWorkerOwnership,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -50,6 +52,10 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import {
+  ProviderRuntimeRegistry,
+  type ProviderRuntimeIdentityValidation,
+} from "./ProviderRuntimeRegistry.ts";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
@@ -150,6 +156,15 @@ export const ProviderSessionManagerV2Error = Schema.Union([
 export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error.Type;
 
 export interface ProviderSessionManagerV2Shape {
+  /** Read-only verification of the emitting generation, never of current thread routing. */
+  readonly validateContinuationEmitter: (
+    identity: ContinuationEmitterIdentity | undefined,
+  ) => Effect.Effect<ProviderRuntimeIdentityValidation>;
+  /** Requires the exact runtime object returned by this manager. */
+  readonly markControlledWorkerExposure: (
+    runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+    owner: MultiAgentWorkerOwnership,
+  ) => Effect.Effect<void, ProviderSessionActivityError>;
   readonly shutdown: Effect.Effect<void>;
   readonly open: (input: {
     readonly threadId: ThreadId;
@@ -419,6 +434,7 @@ export const layerWithOptions = (
           }),
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
+      const runtimeRegistry = yield* Effect.sync(() => new ProviderRuntimeRegistry());
       // One retry per released entry, so a later release with the same id
       // cannot drop cleanup for threads only the earlier session served.
       const releaseRecordRetries = yield* FiberSet.make();
@@ -886,6 +902,8 @@ export const layerWithOptions = (
             DateTime.now,
           ).pipe(candidate.requestEventPermit.withPermits(1));
           const [outcome, releasedAt] = removed;
+          if (outcome === "removed")
+            yield* Effect.sync(() => runtimeRegistry.retire(candidate.exposedRuntime));
           // Another entry took this id while the permit was held; release it instead.
           if (outcome === "changed") return yield* removeLiveEntry(input);
           return [
@@ -2028,6 +2046,21 @@ export const layerWithOptions = (
       );
 
       return ProviderSessionManagerV2.of({
+        validateContinuationEmitter: (identity) =>
+          Effect.sync(() => runtimeRegistry.validate(identity)),
+        markControlledWorkerExposure: (runtime, owner) =>
+          Effect.sync(() => runtimeRegistry.exposeControlledWorker(runtime, owner)).pipe(
+            Effect.flatMap((reason) =>
+              reason === undefined
+                ? Effect.void
+                : Effect.fail(
+                    new ProviderSessionActivityError({
+                      providerSessionId: runtime.providerSessionId,
+                      cause: reason,
+                    }),
+                  ),
+            ),
+          ),
         shutdown,
         open: (input) =>
           sessionOpen.withLock(
@@ -2078,6 +2111,11 @@ export const layerWithOptions = (
                     }),
                 ),
               );
+              // A resumed binding (including one recovered after process loss) is
+              // not evidence of clean history, even when the caller omitted resume metadata.
+              const hasHistoricalSession = yield* projectionStore
+                .hasProviderSessionHistory(input.providerSessionId)
+                .pipe(Effect.catch(() => Effect.succeed(true)));
               const prepared = yield* prepareMcpSession(
                 input.threadId,
                 input.modelSelection.instanceId,
@@ -2183,11 +2221,34 @@ export const layerWithOptions = (
                 pinnedSinceMs: null,
                 idleThreadUnloads: new Map(),
               };
-              yield* Ref.update(sessions, (current) => {
-                const updated = new Map(current);
-                updated.set(key, entry);
-                return updated;
-              });
+              yield* Effect.sync(() =>
+                runtimeRegistry.register({
+                  runtime: exposedRuntime,
+                  providerInstanceId: input.modelSelection.instanceId,
+                  providerSessionId: input.providerSessionId,
+                  historicalState:
+                    hasHistoricalSession ||
+                    input.resumeFromSession !== undefined ||
+                    input.initialNativeThreadId !== undefined
+                      ? "unknown"
+                      : "fresh",
+                }),
+              ).pipe(
+                Effect.andThen(
+                  Scope.addFinalizer(
+                    sessionScope,
+                    Effect.sync(() => runtimeRegistry.retire(exposedRuntime)),
+                  ),
+                ),
+                Effect.andThen(
+                  Ref.update(sessions, (current) => {
+                    const updated = new Map(current);
+                    updated.set(key, entry);
+                    return updated;
+                  }),
+                ),
+                Effect.uninterruptible,
+              );
               // The entry now guards the credential via its recorded id, so
               // the pre-open reservation can be dropped.
               yield* dropReservation;

@@ -28,6 +28,11 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
+
+const layerRuntimeWithoutControllerLaunch = RuntimeLayer.layer.pipe(
+  Layer.provide(Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)({})),
+);
 
 const projectId = ProjectId.make("project:upgrade");
 const icon = { kind: "emoji", emoji: "🦊" } as const;
@@ -137,7 +142,7 @@ const layerRuntime = (dbPath: string) => {
     ),
   );
   return Layer.mergeAll(
-    RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+    layerRuntimeWithoutControllerLaunch.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
     RuntimeLayer.layerProjectService,
   ).pipe(
     Layer.provide(

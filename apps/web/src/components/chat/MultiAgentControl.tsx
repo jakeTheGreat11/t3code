@@ -51,7 +51,7 @@ export const MultiAgentControl = memo(function MultiAgentControl(props: {
       size={props.size}
       disabled={props.disabled}
       onClick={props.onOpen}
-      aria-label={`${multiAgentControlLabel(props.config)}. Execution is not enabled. Configure preferences.`}
+      aria-label={`${multiAgentControlLabel(props.config)}. Configure Multi-Agent preferences.`}
       aria-haspopup="dialog"
       title={MULTI_AGENT_EXECUTION_NOTICE}
     >

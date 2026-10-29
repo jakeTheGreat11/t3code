@@ -1,3 +1,10 @@
+import {
+  acceptedDelegation,
+  automaticCoordinatorReview,
+  AutomaticCoordinatorReview,
+  MultiAgentDelegation,
+} from "./MultiAgentDelegation";
+import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { ThreadFindTimelineContext } from "./ThreadFindProvider";
 import { shouldPreserveAssistantLineBreaks } from "@t3tools/shared/markdownPipeline";
 import { MarkdownFindContext, useFindRevealRef } from "./markdownFindContext";
@@ -313,6 +320,7 @@ import {
 // ---------------------------------------------------------------------------
 
 interface TimelineRowSharedState {
+  controllerRuns: readonly OrchestrationV2Run[];
   citationRequest: AssistantCitationTarget | null;
   listRef: React.RefObject<LegendListRef | null>;
   timestampFormat: TimestampFormat;
@@ -428,6 +436,7 @@ const TIMELINE_MAINTAIN_SCROLL_AT_END = {
     layout: true,
   },
 } as const satisfies MaintainScrollAtEndOptions;
+const EMPTY_CONTROLLER_RUNS: readonly OrchestrationV2Run[] = [];
 const EMPTY_TIMELINE_RUNS: ReadonlyArray<HandoffTimelineRun> = [];
 const EMPTY_RUN_IDS: ReadonlySet<RunId> = new Set();
 // Streamed text lands a paragraph at a time. A smooth scroll to the end
@@ -450,6 +459,7 @@ export interface MessagesTimelineHistoryControls {
 }
 
 interface MessagesTimelineProps {
+  controllerRuns?: readonly OrchestrationV2Run[];
   citationRequest?: AssistantCitationRequest | null;
   citationHistoryLoading?: boolean;
   onCiteAssistantText?: (
@@ -621,6 +631,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   skills = EMPTY_TIMELINE_SKILLS,
   providerStatuses,
   runs: runsProp,
+  controllerRuns = EMPTY_CONTROLLER_RUNS,
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
@@ -1349,6 +1360,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
 
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
+      controllerRuns,
       citationRequest: readyCitationRequest,
       listRef,
       timestampFormat,
@@ -1388,6 +1400,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
       workGroupViewState,
     }),
     [
+      controllerRuns,
       readyCitationRequest,
       listRef,
       timestampFormat,
@@ -2271,6 +2284,16 @@ function MessageAuthorHeading({ children }: { children: string }) {
 
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
+  const review = automaticCoordinatorReview(ctx.controllerRuns, row.message);
+  return review ? (
+    <AutomaticCoordinatorReview {...review} message={row.message} />
+  ) : (
+    <UserMessageTimelineRow row={row} />
+  );
+}
+
+function UserMessageTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const ctx = use(TimelineRowCtx);
   const { onImageExpand, onFileOpen } = ctx;
   const senderThreadId = row.message.senderThreadId;
   const resources = useMemo(
@@ -2832,6 +2855,16 @@ function AttemptFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "at
 
 function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
+  const delegation = acceptedDelegation(ctx.controllerRuns, row.message.id);
+  if (delegation)
+    return (
+      <MultiAgentDelegation
+        run={delegation}
+        runs={ctx.controllerRuns}
+        raw={row.message.text}
+        onOpenThread={ctx.onOpenThread}
+      />
+    );
   const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
 
   return (

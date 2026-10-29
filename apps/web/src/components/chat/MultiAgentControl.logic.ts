@@ -10,13 +10,13 @@ import { isProviderInstancePickerReady, type ProviderInstanceEntry } from "../..
 export type MultiAgentRole = keyof Extract<MultiAgentConfig, { mode: "custom" }>["roles"];
 export const MULTI_AGENT_ROLES = ["planner", "worker", "rescuer", "reviewer"] as const;
 export const MULTI_AGENT_EXECUTION_NOTICE =
-  "Preferences only. Multi-Agent execution is not enabled; sending a message will not launch workers from these settings.";
+  "Auto and Custom support Codex coordinators with Codex workers. Choose the coordinator model in the composer. Auto chooses worker models and reasoning per task from that Codex account's catalog; Budget, Balanced, and Maximum guide economy versus capability. Custom uses your saved role assignments and requires a Worker model. Both modes let the coordinator decide whether to delegate, with up to 2 concurrent workers and 4 tasks total. Other providers are not supported for automatic execution. Selected models and options appear in worker conversations and result notifications, with an automatic coordinator review after workers settle unless stopped.";
 
 export function multiAgentControlLabel(config: MultiAgentConfig) {
   if (config.mode === "off") return "Multi-Agent: Off";
-  if (config.mode === "custom") return "Multi-Agent: Custom (saved)";
+  if (config.mode === "custom") return "Multi-Agent: Custom";
   const preset = config.preset[0]!.toUpperCase() + config.preset.slice(1);
-  return `Multi-Agent: ${preset} (saved)`;
+  return `Multi-Agent: Auto (${preset})`;
 }
 
 export function changeMultiAgentMode(

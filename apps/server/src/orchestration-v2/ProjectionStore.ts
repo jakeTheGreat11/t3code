@@ -1,4 +1,16 @@
 import { projectTurnItemForWire } from "./WireProjection.ts";
+import { controlledWorkerOwnershipProblem } from "./ControlledWorkerOwnership.ts";
+import {
+  MULTI_AGENT_CONTROLLER_LIMITS,
+  MultiAgentControllerState,
+  MultiAgentSubmissionCommitment,
+  MultiAgentWorkerOwnership,
+  NewRunTrigger,
+} from "@t3tools/contracts";
+import {
+  multiAgentTaskOccupiesCapacity,
+  grantMultiAgentSubmission,
+} from "@t3tools/shared/multiAgentController";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
 import type {
@@ -339,6 +351,20 @@ export interface ShellSnapshotOptions {
 }
 
 export interface ProjectionStoreV2Shape {
+  /** Environment-wide history, including sessions no longer attached to any thread. */
+  readonly hasProviderSessionHistory: (
+    providerSessionId: ProviderSessionId,
+  ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly controlledWorkerStartAllowed: (
+    threadId: ThreadId,
+    runId: RunId,
+    attemptId: RunAttemptId,
+  ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  /** Includes completed, archived, or deleted source runs: recovery must not lose their owned work. */
+  readonly getMultiAgentControllerRuns: (
+    unfinishedOnly?: boolean,
+    worker?: { readonly threadId: ThreadId },
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2Run>, ProjectionStoreV2Error>;
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, ProjectionStoreV2Error>;
@@ -540,6 +566,168 @@ export class ProjectionStoreV2 extends Context.Service<ProjectionStoreV2, Projec
 
 export const ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION = 2;
 
+const encodeControllerState = Schema.encodeSync(Schema.fromJsonString(MultiAgentControllerState));
+const encodeSubmissionCommitment = Schema.encodeSync(
+  Schema.fromJsonString(MultiAgentSubmissionCommitment),
+);
+const encodeNewRunTrigger = Schema.encodeSync(Schema.fromJsonString(NewRunTrigger));
+const encodeWorkerOwnership = Schema.encodeSync(Schema.fromJsonString(MultiAgentWorkerOwnership));
+
+function workerOwnershipUpdateProblem(
+  current: OrchestrationV2Run | undefined,
+  event: Extract<OrchestrationV2DomainEvent, { type: "run.created" | "run.updated" }>,
+) {
+  const previous = current?.controlledWorkerOwnership;
+  const next = event.payload.controlledWorkerOwnership;
+  if (previous && next && encodeWorkerOwnership(previous) !== encodeWorkerOwnership(next))
+    return "worker_ownership_conflict";
+  if (!previous && next && (current !== undefined || event.type !== "run.created"))
+    return "worker_ownership_requires_creation";
+  return undefined;
+}
+function newRunTriggerUpdateProblem(
+  current: OrchestrationV2Run | undefined,
+  event: Extract<OrchestrationV2DomainEvent, { type: "run.created" | "run.updated" }>,
+) {
+  const previous = current?.newRunTrigger;
+  const next = event.payload.newRunTrigger;
+  if (previous && next && encodeNewRunTrigger(previous) !== encodeNewRunTrigger(next))
+    return "new_run_trigger_conflict";
+  if (!previous && next && (current !== undefined || event.type !== "run.created"))
+    return "new_run_trigger_requires_creation";
+  return undefined;
+}
+const occupiedControllerSlots = (run: OrchestrationV2Run) =>
+  run.multiAgentController?.tasks.filter(multiAgentTaskOccupiesCapacity).length ?? 0;
+function controllerUpdateProblem(
+  run: OrchestrationV2Run | undefined,
+  event: Extract<OrchestrationV2DomainEvent, { type: "multi-agent.controller.updated" }>,
+  environmentOccupancy: number,
+  executions: readonly OrchestrationV2Run[] = [],
+): string | undefined {
+  if (
+    !run ||
+    run.threadId !== event.threadId ||
+    event.payload.state.coordinatorThreadId !== event.threadId ||
+    event.payload.state.coordinatorRunId !== event.runId
+  )
+    return "controller_origin_mismatch";
+  if (run.multiAgent?.mode !== "custom" && run.multiAgent?.mode !== "auto")
+    return "controller_policy_ineligible";
+  const autoCatalog = run.multiAgentController?.autoRoutingCatalog;
+  if (
+    autoCatalog &&
+    JSON.stringify(autoCatalog) !== JSON.stringify(event.payload.state.autoRoutingCatalog)
+  )
+    return "controller_auto_catalog_conflict";
+  if (
+    run.multiAgent?.mode === "auto" &&
+    event.payload.state.autoRoutingCatalog?.providerInstanceId !== run.providerInstanceId
+  )
+    return "controller_auto_catalog_missing";
+  const coordinatorAttemptId = run.multiAgentController?.coordinatorAttemptId;
+  if (
+    coordinatorAttemptId !== undefined &&
+    event.payload.state.coordinatorAttemptId !== coordinatorAttemptId
+  )
+    return "controller_attempt_conflict";
+  if (
+    !run.multiAgentController &&
+    event.payload.state.coordinatorAttemptId !== undefined &&
+    event.payload.state.coordinatorAttemptId !== run.activeAttemptId
+  )
+    return "controller_attempt_conflict";
+  const previousReviews = run.multiAgentController?.reviews ?? [];
+  const reviews = event.payload.state.reviews ?? [];
+  if (
+    event.payload.revision > (run.multiAgentControllerRevision ?? 0) &&
+    (reviews.length < previousReviews.length ||
+      new Set(reviews.map((review) => review.runId)).size !== reviews.length ||
+      new Set(reviews.flatMap((review) => review.taskIds)).size !==
+        reviews.flatMap((review) => review.taskIds).length ||
+      previousReviews.some((review, index) => {
+        const next = reviews[index];
+        return (
+          !next ||
+          next.runId !== review.runId ||
+          next.attemptId !== review.attemptId ||
+          JSON.stringify(next.taskIds) !== JSON.stringify(review.taskIds) ||
+          (review.submissionClaimedAt !== undefined &&
+            next.submissionClaimedAt !== review.submissionClaimedAt)
+        );
+      }))
+  )
+    return "controller_review_conflict";
+  const currentRevision = run.multiAgentControllerRevision ?? 0;
+  if (event.payload.revision < currentRevision) return undefined;
+  if (event.payload.revision === currentRevision)
+    return run.multiAgentController !== undefined &&
+      encodeControllerState(run.multiAgentController) === encodeControllerState(event.payload.state)
+      ? undefined
+      : "controller_revision_conflict";
+  if (
+    event.payload.expectedRevision !== currentRevision ||
+    event.payload.revision !== currentRevision + 1
+  )
+    return "controller_revision_conflict";
+  const stoppedAt = run.multiAgentController?.coordinatorStoppedAt;
+  if (
+    stoppedAt !== undefined &&
+    (event.payload.state.coordinatorStoppedAt === undefined ||
+      stoppedAt !== event.payload.state.coordinatorStoppedAt)
+  )
+    return "controller_stop_marker_conflict";
+  // Lifecycle writes do not all hold the coordinator command lock. Validate
+  // fresh execution admissions again in the same transaction as their commit.
+  const initialAttempt = run.multiAgentController?.coordinatorAttemptId;
+  const existingTaskIds = new Set(run.multiAgentController?.tasks.map((task) => task.taskId));
+  if (
+    initialAttempt !== undefined &&
+    event.payload.state.tasks.some((task) => {
+      if (existingTaskIds.has(task.taskId)) return false;
+      if (stoppedAt !== undefined) return true;
+      if (task.proposalAttemptId === initialAttempt)
+        return run.status !== "running" || run.activeAttemptId !== initialAttempt;
+      const review = run.multiAgentController?.reviews?.find(
+        (review) => review.attemptId === task.proposalAttemptId,
+      );
+      const execution = executions.find((execution) => execution.id === review?.runId);
+      return (
+        !execution ||
+        execution.multiAgentReview?.coordinatorRunId !== run.id ||
+        execution.threadId !== run.threadId ||
+        execution.providerInstanceId !== run.providerInstanceId ||
+        execution.status !== "running" ||
+        execution.activeAttemptId !== task.proposalAttemptId
+      );
+    })
+  )
+    return "controller_execution_inactive";
+  const occupied = event.payload.state.tasks.filter(multiAgentTaskOccupiesCapacity).length;
+  const claims = event.payload.state.tasks.flatMap((task) =>
+    task.submissionCommitment ? [task.submissionCommitment.invocationClaimId] : [],
+  );
+  if (new Set(claims).size !== claims.length) return "submission_claim_conflict";
+  for (const previous of run.multiAgentController?.tasks ?? []) {
+    if (!previous.submissionCommitment) continue;
+    const next = event.payload.state.tasks.find((task) => task.taskId === previous.taskId);
+    if (
+      !next?.submissionCommitment ||
+      encodeSubmissionCommitment(next.submissionCommitment) !==
+        encodeSubmissionCommitment(previous.submissionCommitment)
+    )
+      return "submission_commitment_conflict";
+  }
+  if (occupied > MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerController)
+    return "controller_capacity";
+  if (
+    environmentOccupancy - occupiedControllerSlots(run) + occupied >
+    MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerEnvironment
+  )
+    return "environment_capacity";
+  return undefined;
+}
+
 function needsRecovery(
   projection: OrchestrationV2ThreadProjection,
   kind: ProjectionRecoveryKind,
@@ -641,6 +829,50 @@ export function upsertProviderTurn(
   });
 }
 
+/** Ownership only: this does not authorize submissions or interpret Stop/commitments. */
+function controlledWorkerStartAllowed(
+  store: Pick<ProjectionStoreV2Shape, "getThreadRecords" | "getMultiAgentControllerRuns">,
+  threadId: ThreadId,
+  runId: RunId,
+  attemptId: RunAttemptId,
+): Effect.Effect<boolean, ProjectionStoreV2Error> {
+  return Effect.gen(function* () {
+    const worker = yield* store.getThreadRecords(threadId, ["runs", "attempts", "providerThreads"]);
+    const run = worker.runs.find((row) => row.id === runId);
+    if (!run) return false;
+    if (!run.controlledWorkerOwnership && run.ordinal !== 1) return true;
+    const controllers = yield* store.getMultiAgentControllerRuns(false, { threadId });
+    const associations = controllers.flatMap((coordinator) =>
+      (coordinator.multiAgentController?.tasks ?? [])
+        .filter((task) => task.workerThreadId === threadId)
+        .map((task) => ({ coordinator, task })),
+    );
+    const owner = run.controlledWorkerOwnership;
+    // Only the initial run is controlled; later manual runs returned above.
+    if (!owner) return associations.length === 0;
+    const association = associations[0];
+    if (
+      associations.length !== 1 ||
+      !association ||
+      controlledWorkerOwnershipProblem(association.coordinator, worker.thread, run)
+    )
+      return false;
+    const coordinator = yield* store.getThreadRecords(owner.coordinatorThreadId, []);
+    if (coordinator.thread.projectId !== worker.thread.projectId) return false;
+    const attempt = worker.attempts.find((row) => row.id === attemptId);
+    const providerThread = worker.providerThreads.find((row) => row.id === owner.providerThreadId);
+    return (
+      attemptId === owner.workerAttemptId &&
+      attempt?.runId === runId &&
+      attempt.providerInstanceId === owner.providerInstanceId &&
+      attempt.providerThreadId === owner.providerThreadId &&
+      providerThread?.appThreadId === threadId &&
+      providerThread.providerInstanceId === owner.providerInstanceId &&
+      providerThread.providerSessionId === owner.providerSessionId
+    );
+  });
+}
+
 /** A stale run snapshot must not erase fields that other events recorded on the run. */
 function preserveRunRecordedFields(
   current: OrchestrationV2Run | undefined,
@@ -649,7 +881,18 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
-    ...(current.multiAgent === undefined ? {} : { multiAgent: current.multiAgent }),
+    ...(current.multiAgentReview ? { multiAgentReview: current.multiAgentReview } : {}),
+    ...(current.multiAgentController === undefined
+      ? {}
+      : {
+          multiAgentController: current.multiAgentController,
+          multiAgentControllerRevision: current.multiAgentControllerRevision ?? 0,
+        }),
+    ...(current.controlledWorkerOwnership === undefined
+      ? {}
+      : { controlledWorkerOwnership: current.controlledWorkerOwnership }),
+    ...(current.newRunTrigger === undefined ? {} : { newRunTrigger: current.newRunTrigger }),
+    multiAgent: current.multiAgent ?? { mode: "off" },
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
       : {}),
@@ -762,6 +1005,20 @@ export function applyToProjection(
           ),
         ),
       });
+    case "multi-agent.controller.updated":
+      return {
+        ...base,
+        runs: base.runs.map((run) =>
+          run.id !== event.runId ||
+          (run.multiAgentControllerRevision ?? 0) >= event.payload.revision
+            ? run
+            : {
+                ...run,
+                multiAgentController: event.payload.state,
+                multiAgentControllerRevision: event.payload.revision,
+              },
+        ),
+      };
     case "run.background-work-cancelled":
       return {
         ...base,
@@ -885,12 +1142,14 @@ export function applyToProjection(
 export interface ProjectionReplayState {
   readonly projections: Map<ThreadId, OrchestrationV2ThreadProjection>;
   readonly providerSessionThreadIds: Map<ProviderSessionId, ReadonlySet<ThreadId>>;
+  readonly historicalProviderSessionIds: Set<ProviderSessionId>;
 }
 
 function makeProjectionReplayState(): ProjectionReplayState {
   return {
     projections: new Map(),
     providerSessionThreadIds: new Map(),
+    historicalProviderSessionIds: new Set(),
   };
 }
 
@@ -921,6 +1180,7 @@ function applyToProjectionReplayState(
 
   switch (event.type) {
     case "provider-session.attached": {
+      state.historicalProviderSessionIds.add(event.payload.id);
       const boundThreadIds = new Set(state.providerSessionThreadIds.get(event.payload.id) ?? []);
       boundThreadIds.add(event.threadId);
       state.providerSessionThreadIds.set(event.payload.id, boundThreadIds);
@@ -936,6 +1196,7 @@ function applyToProjectionReplayState(
       break;
     }
     case "provider-session.updated": {
+      state.historicalProviderSessionIds.add(event.payload.id);
       const boundThreadIds = state.providerSessionThreadIds.get(event.payload.id) ?? [];
       for (const threadId of boundThreadIds) {
         if (threadId === event.threadId) continue;
@@ -1828,11 +2089,50 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     `;
     // The policy is chosen once at creation, even if a later lifecycle snapshot carries another value.
     const keepRunPolicy = (payload: Statement.Fragment) => sql`
-      CASE WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.multiAgent') IS NOT NULL
-        THEN json_set(${payload}, '$.multiAgent', json_extract(orchestration_v2_projection_runs.payload_json, '$.multiAgent'))
-        ELSE ${payload}
-      END
+      json_set(${payload}, '$.multiAgent', COALESCE(json_extract(orchestration_v2_projection_runs.payload_json, '$.multiAgent'), json('{"mode":"off"}')))
     `;
+    const keepRunController = (payload: Statement.Fragment) => sql`
+      CASE WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.multiAgentController') = 'object'
+      THEN json_set(${payload}, '$.multiAgentController', json_extract(orchestration_v2_projection_runs.payload_json, '$.multiAgentController'),
+        '$.multiAgentControllerRevision', COALESCE(json_extract(orchestration_v2_projection_runs.payload_json, '$.multiAgentControllerRevision'), 0))
+      ELSE ${payload} END
+    `;
+    const keepRunOwner = (payload: Statement.Fragment) => sql`
+      CASE WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.controlledWorkerOwnership') = 'object'
+      THEN json_set(${payload}, '$.controlledWorkerOwnership', json_extract(orchestration_v2_projection_runs.payload_json, '$.controlledWorkerOwnership'))
+      ELSE ${payload} END
+    `;
+    const getMultiAgentControllerRuns: ProjectionStoreV2Shape["getMultiAgentControllerRuns"] = (
+      unfinishedOnly = true,
+      worker,
+    ) =>
+      Effect.gen(function* () {
+        const rows = yield* sql<{ payload_json: string }>`
+          SELECT payload_json FROM orchestration_v2_projection_runs
+          WHERE CASE WHEN json_valid(payload_json) THEN
+            json_type(payload_json, '$.multiAgentController') = 'object'
+            ${unfinishedOnly ? sql`AND json_extract(payload_json, '$.multiAgentController.status') IN ('open', 'cancelling')` : sql``}
+            ELSE 0 END
+          ${
+            worker === undefined
+              ? sql``
+              : sql`AND EXISTS (
+            SELECT 1 FROM json_each(payload_json, '$.multiAgentController.tasks') AS task
+            WHERE json_extract(task.value, '$.workerThreadId') = ${worker.threadId}
+          )`
+          }
+          ORDER BY thread_id, ordinal
+        `;
+        return yield* Effect.forEach(rows, (row) => decodeRunPayload(row.payload_json));
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProjectionStoreReadError({
+              threadId: ThreadId.make("multi-agent-controllers"),
+              cause,
+            }),
+        ),
+      );
 
     const apply: ProjectionStoreV2Shape["apply"] = (event) =>
       Effect.gen(function* () {
@@ -1910,6 +2210,49 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           }
           case "run.created":
           case "run.updated": {
+            if (event.payload.controlledWorkerOwnership || event.payload.newRunTrigger) {
+              const existing = yield* sql<{
+                payload_json: string;
+              }>`SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id = ${event.payload.id}`;
+              const current = existing[0]
+                ? yield* decodeRunPayload(existing[0].payload_json)
+                : undefined;
+              const problem =
+                workerOwnershipUpdateProblem(current, event) ??
+                newRunTriggerUpdateProblem(current, event);
+              if (problem)
+                return yield* new ProjectionStoreApplyEventError({
+                  eventType: event.type,
+                  cause: problem,
+                });
+              if (!current && event.payload.controlledWorkerOwnership) {
+                const owner = event.payload.controlledWorkerOwnership;
+                const coordinator = yield* getThreadRecords(owner.coordinatorThreadId, ["runs"], {
+                  runIds: [owner.coordinatorRunId],
+                });
+                const worker = yield* getThreadRecords(event.threadId, ["runs"]);
+                const coordinatorRun = coordinator.runs.find(
+                  (row) => row.id === owner.coordinatorRunId,
+                );
+                if (
+                  !coordinatorRun ||
+                  worker.runs.length !== 0 ||
+                  event.payload.threadId !== event.threadId ||
+                  event.payload.id !== event.runId ||
+                  coordinator.thread.projectId !== worker.thread.projectId ||
+                  controlledWorkerOwnershipProblem(
+                    coordinatorRun,
+                    worker.thread,
+                    event.payload,
+                    true,
+                  )
+                )
+                  return yield* new ProjectionStoreApplyEventError({
+                    eventType: event.type,
+                    cause: "worker_ownership_invalid",
+                  });
+              }
+            }
             const payloadJson = yield* encodeRunPayload(event.payload);
             const payload = parseEncodedPayload(payloadJson);
             yield* sql`
@@ -1947,10 +2290,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = ${keepRunPolicy(
-                  keepRecordedRunField(
-                    keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
-                    "$.restartCancelledBackgroundWork",
+                payload_json = ${keepRunOwner(
+                  keepRunController(
+                    keepRunPolicy(
+                      keepRecordedRunField(
+                        keepRecordedRunField(
+                          keepRecordedRunField(
+                            keepRecordedRunField(sql`excluded.payload_json`, "$.multiAgentReview"),
+                            "$.newRunTrigger",
+                          ),
+                          "$.delegatedCompletion",
+                        ),
+                        "$.restartCancelledBackgroundWork",
+                      ),
+                    ),
                   ),
                 )}
             `;
@@ -1970,6 +2323,96 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               )
               WHERE run_id = ${event.payload.runId} AND thread_id = ${event.threadId}
             `;
+            break;
+          }
+          case "multi-agent.controller.updated": {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                const rows = yield* sql<{
+                  payload_json: string;
+                }>`SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id = ${event.runId} AND thread_id = ${event.threadId}`;
+                const run = rows[0] ? yield* decodeRunPayload(rows[0].payload_json) : undefined;
+                const increasing =
+                  event.payload.state.tasks.filter(multiAgentTaskOccupiesCapacity).length >
+                  (run ? occupiedControllerSlots(run) : 0);
+                const controllers = increasing ? yield* getMultiAgentControllerRuns() : [];
+                const reviewRuns =
+                  run?.multiAgentController?.reviews?.length &&
+                  event.payload.state.tasks.some(
+                    (task) =>
+                      !run.multiAgentController?.tasks.some((old) => old.taskId === task.taskId),
+                  )
+                    ? (yield* getThreadRecords(event.threadId, ["runs"], {
+                        runIds: run.multiAgentController.reviews.map((review) => review.runId),
+                      })).runs
+                    : [];
+                const problem = controllerUpdateProblem(
+                  run,
+                  event,
+                  increasing
+                    ? controllers.reduce(
+                        (sum, candidate) => sum + occupiedControllerSlots(candidate),
+                        0,
+                      )
+                    : run
+                      ? occupiedControllerSlots(run)
+                      : 0,
+                  reviewRuns,
+                );
+                if (problem)
+                  return yield* new ProjectionStoreApplyEventError({
+                    eventType: event.type,
+                    cause: problem,
+                  });
+                if ((run?.multiAgentControllerRevision ?? 0) >= event.payload.revision) return;
+                for (const task of event.payload.state.tasks) {
+                  const commitment = task.submissionCommitment;
+                  if (
+                    !commitment ||
+                    run?.multiAgentController?.tasks.find((old) => old.taskId === task.taskId)
+                      ?.submissionCommitment
+                  )
+                    continue;
+                  const worker = yield* getThreadRecords(
+                    commitment.workerThreadId,
+                    ["runs", "attempts", "providerThreads"],
+                    { runIds: [commitment.workerRunId] },
+                  );
+                  const workerRun = worker.runs.find((row) => row.id === commitment.workerRunId);
+                  const attempt = worker.attempts.find(
+                    (row) => row.id === commitment.workerAttemptId,
+                  );
+                  const providerThread = worker.providerThreads.find(
+                    (row) => row.id === commitment.providerThreadId,
+                  );
+                  const owner = yield* getThreadRecords(event.threadId, [], {
+                    runIds: [event.runId],
+                  });
+                  const result =
+                    run?.multiAgentController &&
+                    workerRun &&
+                    attempt &&
+                    providerThread &&
+                    owner.thread.projectId === worker.thread.projectId
+                      ? grantMultiAgentSubmission(run.multiAgentController, commitment, {
+                          thread: worker.thread,
+                          run: workerRun,
+                          attempt,
+                          providerThread,
+                        })
+                      : undefined;
+                  if (result?.status !== "granted")
+                    return yield* new ProjectionStoreApplyEventError({
+                      eventType: event.type,
+                      cause: "submission_worker_binding_conflict",
+                    });
+                }
+                const stateJson = encodeControllerState(event.payload.state);
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                SET payload_json = json_set(payload_json, '$.multiAgentController', json(${stateJson}), '$.multiAgentControllerRevision', ${event.payload.revision})
+                WHERE run_id = ${event.runId} AND thread_id = ${event.threadId}`;
+              }),
+            );
             break;
           }
           case "run-attempt.created":
@@ -5984,6 +6427,28 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getProviderControlContext,
       getLimitRecoveryCandidates,
       getRecoveryThreadIds,
+      getMultiAgentControllerRuns,
+      hasProviderSessionHistory: (providerSessionId) =>
+        sql<{ provider_session_id: string }>`
+        SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions
+        WHERE provider_session_id = ${providerSessionId} LIMIT 1
+      `.pipe(
+          Effect.map((rows) => rows.length > 0),
+          Effect.mapError(
+            (cause) =>
+              new ProjectionStoreReadError({
+                threadId: ThreadId.make("provider-runtime-history"),
+                cause,
+              }),
+          ),
+        ),
+      controlledWorkerStartAllowed: (threadId, runId, attemptId) =>
+        controlledWorkerStartAllowed(
+          { getThreadRecords, getMultiAgentControllerRuns },
+          threadId,
+          runId,
+          attemptId,
+        ),
       getUnreadableThreadIds,
       getThreadSnapshot,
       getThreadSnapshotWindow,
@@ -6003,21 +6468,142 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
     const sequence = yield* Ref.make(0);
 
     const service: ProjectionStoreV2Shape = {
+      hasProviderSessionHistory: (providerSessionId) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) => state.historicalProviderSessionIds.has(providerSessionId)),
+        ),
+      controlledWorkerStartAllowed: (threadId, runId, attemptId) =>
+        controlledWorkerStartAllowed(service, threadId, runId, attemptId),
+      getMultiAgentControllerRuns: (unfinishedOnly = true, worker) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()]
+              .flatMap((projection) => projection.runs)
+              .filter(
+                (run) =>
+                  run.multiAgentController !== undefined &&
+                  (worker === undefined ||
+                    run.multiAgentController.tasks.some(
+                      (task) => task.workerThreadId === worker.threadId,
+                    )) &&
+                  (!unfinishedOnly ||
+                    run.multiAgentController.status === "open" ||
+                    run.multiAgentController.status === "cancelling"),
+              ),
+          ),
+        ),
       apply: (event) =>
         Effect.gen(function* () {
-          const result = yield* Ref.modify(replayState, (existing) => {
-            const next: ProjectionReplayState = {
-              projections: new Map(existing.projections),
-              providerSessionThreadIds: new Map(existing.providerSessionThreadIds),
-            };
-            if (!applyToProjectionReplayState(next, event)) {
-              return [
-                new ProjectionStoreThreadNotFoundError({ threadId: event.threadId }),
-                existing,
-              ] as const;
-            }
-            return [undefined, next] as const;
-          });
+          const result = yield* Ref.modify(
+            replayState,
+            (existing): readonly [ProjectionStoreV2Error | undefined, ProjectionReplayState] => {
+              if (event.type === "multi-agent.controller.updated") {
+                const runs = [...existing.projections.values()].flatMap(
+                  (projection) => projection.runs,
+                );
+                const problem = controllerUpdateProblem(
+                  runs.find((run) => run.id === event.runId),
+                  event,
+                  runs.reduce((sum, run) => sum + occupiedControllerSlots(run), 0),
+                  runs,
+                );
+                if (problem)
+                  return [
+                    new ProjectionStoreApplyEventError({ eventType: event.type, cause: problem }),
+                    existing,
+                  ] as const;
+                const owner = existing.projections.get(event.threadId);
+                const run = runs.find((row) => row.id === event.runId);
+                if ((run?.multiAgentControllerRevision ?? 0) < event.payload.revision)
+                  for (const task of event.payload.state.tasks) {
+                    const commitment = task.submissionCommitment;
+                    if (
+                      !commitment ||
+                      run?.multiAgentController?.tasks.find((old) => old.taskId === task.taskId)
+                        ?.submissionCommitment
+                    )
+                      continue;
+                    const worker = existing.projections.get(commitment.workerThreadId);
+                    const workerRun = worker?.runs.find((row) => row.id === commitment.workerRunId);
+                    const attempt = worker?.attempts.find(
+                      (row) => row.id === commitment.workerAttemptId,
+                    );
+                    const providerThread = worker?.providerThreads.find(
+                      (row) => row.id === commitment.providerThreadId,
+                    );
+                    const result =
+                      run?.multiAgentController &&
+                      worker &&
+                      workerRun &&
+                      attempt &&
+                      providerThread &&
+                      owner?.thread.projectId === worker.thread.projectId
+                        ? grantMultiAgentSubmission(run.multiAgentController, commitment, {
+                            thread: worker.thread,
+                            run: workerRun,
+                            attempt,
+                            providerThread,
+                          })
+                        : undefined;
+                    if (result?.status !== "granted")
+                      return [
+                        new ProjectionStoreApplyEventError({
+                          eventType: event.type,
+                          cause: "submission_worker_binding_conflict",
+                        }),
+                        existing,
+                      ] as const;
+                  }
+              }
+              if (event.type === "run.created" || event.type === "run.updated") {
+                const worker = existing.projections.get(event.threadId);
+                const current = worker?.runs.find((row) => row.id === event.payload.id);
+                let problem =
+                  workerOwnershipUpdateProblem(current, event) ??
+                  newRunTriggerUpdateProblem(current, event);
+                if (!current && event.payload.controlledWorkerOwnership) {
+                  const owner = event.payload.controlledWorkerOwnership;
+                  const coordinator = existing.projections.get(owner.coordinatorThreadId);
+                  const coordinatorRun = coordinator?.runs.find(
+                    (row) => row.id === owner.coordinatorRunId,
+                  );
+                  if (
+                    !worker ||
+                    !coordinatorRun ||
+                    worker.runs.length !== 0 ||
+                    event.payload.threadId !== event.threadId ||
+                    event.payload.id !== event.runId ||
+                    coordinator?.thread.projectId !== worker.thread.projectId
+                  )
+                    problem = "worker_ownership_invalid";
+                  else
+                    problem = controlledWorkerOwnershipProblem(
+                      coordinatorRun,
+                      worker.thread,
+                      event.payload,
+                      true,
+                    );
+                }
+                if (problem)
+                  return [
+                    new ProjectionStoreApplyEventError({ eventType: event.type, cause: problem }),
+                    existing,
+                  ] as const;
+              }
+              const next: ProjectionReplayState = {
+                projections: new Map(existing.projections),
+                providerSessionThreadIds: new Map(existing.providerSessionThreadIds),
+                historicalProviderSessionIds: new Set(existing.historicalProviderSessionIds),
+              };
+              if (!applyToProjectionReplayState(next, event)) {
+                return [
+                  new ProjectionStoreThreadNotFoundError({ threadId: event.threadId }),
+                  existing,
+                ] as const;
+              }
+              return [undefined, next] as const;
+            },
+          );
 
           if (result) {
             return yield* result;

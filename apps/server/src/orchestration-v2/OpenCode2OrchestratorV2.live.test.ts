@@ -68,11 +68,16 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+
+const layerRuntimeWithoutControllerLaunch = RuntimeLayer.layer.pipe(
+  Layer.provide(Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)({})),
+);
 
 const binaryPath = process.env.OPENCODE2_BIN;
 const ROOT = process.env.OPENCODE2_LIVE_ROOT ?? "";
@@ -206,7 +211,7 @@ const layerProviderInstanceRegistry = ProviderInstanceRegistryHydration.layer.pi
     ),
   ),
 );
-const layerOrchestration = RuntimeLayer.layer.pipe(
+const layerOrchestration = layerRuntimeWithoutControllerLaunch.pipe(
   Layer.provide(ProviderTurnStartServiceTestkit.layer),
   Layer.provide(layerMcpRegistry),
   Layer.provide(SqlitePersistence.layerMemory),

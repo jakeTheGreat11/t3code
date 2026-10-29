@@ -9,6 +9,7 @@ import {
   type MessageId,
   type ModelSelection,
   type MultiAgentConfig,
+  type MultiAgentWorkerLaunchOwner,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
   type OrchestrationV2ProviderThreadNativeMetadata,
@@ -50,6 +51,7 @@ import type * as Orchestrator from "./Orchestrator.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { ControlledWorkerLaunchOwner } from "./ControlledWorkerOwnership.ts";
 
 export type ThreadLaunchWorkspaceStrategy =
   | { readonly type: "root"; readonly branch?: string | undefined }
@@ -76,6 +78,7 @@ export interface ThreadLaunchInitialMessage {
 }
 
 export interface ThreadLaunchInput {
+  readonly controlledWorkerLaunchOwner?: MultiAgentWorkerLaunchOwner;
   readonly commandId: CommandId;
   readonly threadId?: ThreadId;
   readonly reuseExistingThread?: boolean;
@@ -948,7 +951,10 @@ const make = Effect.gen(function* () {
               createdBy: input.createdBy,
               creationSource: input.creationSource,
             })
-            .pipe(Effect.mapError(mapError(input, "dispatch-message", threadId)));
+            .pipe(
+              Effect.provideService(ControlledWorkerLaunchOwner, input.controlledWorkerLaunchOwner),
+              Effect.mapError(mapError(input, "dispatch-message", threadId)),
+            );
           const runCreated = dispatched.storedEvents.find(
             (stored) => stored.event.type === "run.created",
           );
@@ -969,6 +975,24 @@ const make = Effect.gen(function* () {
           runId !== null &&
           projection.runs.some((run) => run.id === runId && run.status === "preparing");
         const shouldSchedule = runId === null ? Option.isNone(launchReceipt) : runIsPreparing;
+        if (input.controlledWorkerLaunchOwner && input.initialMessage) {
+          const expected = input.controlledWorkerLaunchOwner;
+          const owner = projection.runs.find((run) => run.id === runId)?.controlledWorkerOwnership;
+          if (
+            !owner ||
+            owner.coordinatorThreadId !== expected.coordinatorThreadId ||
+            owner.coordinatorRunId !== expected.coordinatorRunId ||
+            owner.taskId !== expected.taskId ||
+            owner.workerThreadId !== expected.workerThreadId ||
+            owner.launchCommandId !== expected.launchCommandId ||
+            owner.launchMessageId !== expected.launchMessageId
+          )
+            return yield* mapError(
+              input,
+              "dispatch-message",
+              threadId,
+            )("Controlled initial run has missing or conflicting ownership.");
+        }
         // A retried root launch prepares the folder its first attempt bound, so
         // a Scratch thread keeps its own. Other root launches bind no folder.
         const boundWorktreePath = projection.thread.worktreePath;

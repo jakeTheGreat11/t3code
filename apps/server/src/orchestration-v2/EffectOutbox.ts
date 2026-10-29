@@ -30,6 +30,16 @@ import { forkParked } from "../serverActivation.ts";
 
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("multi-agent.controller.schedule"),
+    coordinatorRunId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("multi-agent.worker.launch"),
+    coordinatorRunId: RunId,
+    taskId: NodeId,
+    launchCommandId: CommandId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
   }),
@@ -121,6 +131,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
+  "multi-agent.controller.schedule",
+  "multi-agent.worker.launch",
   "provider-runtime.continue",
   "provider-session.detach",
   "provider-thread.rollback",

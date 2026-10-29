@@ -4302,6 +4302,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             "continuation request",
           );
           const request = harness.continuationRequests[0];
+          assert.deepEqual(request?.emitterIdentity, harness.runtime.continuationEmitterIdentity);
+          assert.equal(request?.emitterIdentity?.type, "known");
+          assert.deepInclude(request?.emitterIdentity, {
+            type: "known",
+            providerInstanceId: harness.runtime.instanceId,
+            providerSessionId: harness.runtime.providerSessionId,
+          });
           assert.equal(request?.threadId, harness.threadId);
           assert.equal(request?.providerThreadId, harness.providerThread.id);
           assert.equal(request?.driver, CodexAdapterV2.CODEX_DRIVER_KIND);

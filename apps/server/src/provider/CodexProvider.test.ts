@@ -1,6 +1,33 @@
 import { assert, it } from "@effect/vitest";
 
-import { applyPreferredCodexDefaultModel, mapCodexModelCapabilities } from "./CodexProvider.ts";
+import {
+  applyPreferredCodexDefaultModel,
+  mapCodexModelCapabilities,
+  parseCodexModelListResponse,
+} from "./CodexProvider.ts";
+
+it("preserves provider-supplied model guidance without inventing rankings", () => {
+  const models = parseCodexModelListResponse({
+    nextCursor: null,
+    data: [
+      {
+        model: "catalog-model",
+        id: "catalog-model",
+        displayName: "Catalog model",
+        description: "  Provider guidance for coding tasks.  ",
+        isDefault: true,
+        hidden: false,
+        additionalSpeedTiers: [],
+        defaultReasoningEffort: "low",
+        defaultServiceTier: null,
+        serviceTiers: [],
+        supportedReasoningEfforts: [],
+      },
+    ],
+  });
+  assert.equal(models[0]!.description, "Provider guidance for coding tasks.");
+  assert.equal(models[0]!.slug, "catalog-model");
+});
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({

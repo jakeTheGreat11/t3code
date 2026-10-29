@@ -41,8 +41,13 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
 import { CURSOR_MODEL_SELECTION, SUBAGENT_PROMPT } from "./testkit/fixtures/shared.ts";
+
+const layerRuntimeWithoutControllerLaunch = RuntimeLayer.layer.pipe(
+  Layer.provide(Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)({})),
+);
 
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
@@ -114,7 +119,7 @@ const layerProviderInstanceRegistry = ProviderInstanceRegistryHydration.layer.pi
   ),
 );
 
-const layerLive = RuntimeLayer.layer.pipe(
+const layerLive = layerRuntimeWithoutControllerLaunch.pipe(
   Layer.provide(ProviderTurnStartServiceTestkit.layer),
   Layer.provide(McpSessionRegistryTestkit.layer),
   Layer.provide(SqlitePersistence.layerMemory),

@@ -5,6 +5,10 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   MessageId,
+  CommandId,
+  RunAttemptId,
+  ProviderSessionId,
+  EventId,
   ProjectId,
   ProviderInstanceId,
   NodeId,
@@ -475,4 +479,143 @@ it("does not scan every row against every run for a streaming item update", () =
   expect(next?.visibleTurnItems.at(-1)?.item).toBe(payload);
   expect(next?.visibleTurnItems[0]).toBe(projection.visibleTurnItems[0]);
   expect(runReads).toBeLessThanOrEqual(100);
+});
+
+it("applies revisioned controller metadata without losing it to lifecycle updates or replay", () => {
+  const policy = { mode: "custom" as const, roles: {} };
+  const state = {
+    coordinatorThreadId: threadId,
+    coordinatorRunId: runId,
+    status: "open" as const,
+    tasks: [],
+  };
+  const event: OrchestrationV2DomainEvent = {
+    id: EventId.make("controller:1"),
+    type: "multi-agent.controller.updated",
+    threadId,
+    runId,
+    occurredAt: now,
+    payload: { state, expectedRevision: 0, revision: 1 },
+  };
+  const initial = { ...emptyProjection, runs: [{ ...run, multiAgent: policy }] };
+  const updated = applyOrchestrationV2ProjectionEvent(initial, event)!;
+  const stale = applyOrchestrationV2ProjectionEvent(updated, {
+    id: EventId.make("stale-lifecycle"),
+    type: "run.updated",
+    threadId,
+    runId,
+    occurredAt: now,
+    payload: {
+      ...run,
+      multiAgent: { mode: "off" },
+      multiAgentController: { ...state, status: "settled" },
+      multiAgentControllerRevision: 0,
+    },
+  })!;
+  expect(stale.runs[0]).toMatchObject({
+    multiAgent: policy,
+    multiAgentController: state,
+    multiAgentControllerRevision: 1,
+  });
+  const terminal = applyOrchestrationV2ProjectionEvent(stale, {
+    ...event,
+    id: EventId.make("controller:2"),
+    payload: { state: { ...state, status: "cancelled" }, expectedRevision: 1, revision: 2 },
+  })!;
+  const replayed = applyOrchestrationV2ProjectionEvent(terminal, event)!;
+  expect(replayed.runs[0]).toMatchObject({
+    multiAgentController: { status: "cancelled" },
+    multiAgentControllerRevision: 2,
+  });
+  expect(replayed.runs[0]?.status).toBe(run.status);
+});
+
+it("does not replace a legacy Off policy through a later lifecycle snapshot", () => {
+  const initial = { ...emptyProjection, runs: [run] };
+  const updated = applyOrchestrationV2ProjectionEvent(initial, {
+    id: EventId.make("legacy-policy"),
+    type: "run.updated",
+    threadId,
+    runId,
+    occurredAt: now,
+    payload: { ...run, multiAgent: { mode: "custom", roles: {} } },
+  })!;
+  expect(updated.runs[0]?.multiAgent).toEqual({ mode: "off" });
+});
+
+it("retains immutable controlled initial ownership through stale lifecycle snapshots and leaves follow-ups independent", () => {
+  const ownership = {
+    coordinatorThreadId: ThreadId.make("coordinator"),
+    coordinatorRunId: RunId.make("coordinator-run"),
+    taskId: NodeId.make("task"),
+    workerThreadId: threadId,
+    workerRunId: runId,
+    workerAttemptId: RunAttemptId.make("initial-attempt"),
+    launchCommandId: CommandId.make("launch"),
+    launchMessageId: run.userMessageId!,
+    providerInstanceId: run.providerInstanceId,
+    providerThreadId: ProviderThreadId.make("initial-provider-thread"),
+    providerSessionId: ProviderSessionId.make("initial-session"),
+  };
+  const initial = applyOrchestrationV2ProjectionEvent(emptyProjection, {
+    id: EventId.make("owned:create"),
+    type: "run.created",
+    threadId,
+    runId,
+    occurredAt: now,
+    payload: { ...run, controlledWorkerOwnership: ownership },
+  })!;
+  const updated = applyOrchestrationV2ProjectionEvent(initial, {
+    id: EventId.make("owned:update"),
+    type: "run.updated",
+    threadId,
+    runId,
+    occurredAt: now,
+    payload: { ...run, status: "cancelled" },
+  })!;
+  expect(updated.runs[0]?.controlledWorkerOwnership).toEqual(ownership);
+  expect(updated.runs[0]?.status).toBe("cancelled");
+  const followUp = applyOrchestrationV2ProjectionEvent(updated, {
+    id: EventId.make("manual:create"),
+    type: "run.created",
+    threadId,
+    runId: RunId.make("manual"),
+    occurredAt: now,
+    payload: {
+      ...run,
+      id: RunId.make("manual"),
+      ordinal: 2,
+      userMessageId: MessageId.make("manual-message"),
+    },
+  })!;
+  expect(followUp.runs[1]?.controlledWorkerOwnership).toBeUndefined();
+});
+
+it("retains automatic trigger provenance when lifecycle updates omit or conflict with it", () => {
+  const trigger = {
+    type: "automatic" as const,
+    kind: "restart" as const,
+    provenance: { type: "unknown" as const },
+  };
+  const initial = { ...emptyProjection, runs: [{ ...run, newRunTrigger: trigger }] };
+  for (const payload of [run, { ...run, newRunTrigger: { type: "manual" as const } }]) {
+    const updated = applyOrchestrationV2ProjectionEvent(initial, {
+      id: EventId.make("trigger:update"),
+      type: "run.updated",
+      threadId,
+      runId,
+      occurredAt: now,
+      payload,
+    })!;
+    expect(updated.runs[0]?.newRunTrigger).toEqual(trigger);
+  }
+  const manual = applyOrchestrationV2ProjectionEvent(initial, {
+    id: EventId.make("trigger:follow-up"),
+    type: "run.created",
+    threadId,
+    runId: RunId.make("follow-up"),
+    occurredAt: now,
+    payload: { ...run, id: RunId.make("follow-up"), ordinal: 2, newRunTrigger: { type: "manual" } },
+  })!;
+  expect(manual.runs[1]?.newRunTrigger).toEqual({ type: "manual" });
 });

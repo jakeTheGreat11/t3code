@@ -7,6 +7,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
+import { controlledCodexOriginBlocked } from "./ControlledCodexContinuation.ts";
 
 const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
 
@@ -84,7 +85,7 @@ export const layer = Layer.effectDiscard(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
         const projection = yield* threads.getThreadRecords(
           request.threadId,
-          ["messages", "runs", "providerTurns"],
+          ["messages", "runs", "providerTurns", "providerThreads"],
           {
             messageIds:
               request.delegatedCompletion === undefined
@@ -92,6 +93,17 @@ export const layer = Layer.effectDiscard(
                 : [request.delegatedCompletion.messageId],
           },
         );
+        if (
+          request.driver === "codex" &&
+          controlledCodexOriginBlocked(projection, request.delegatedCompletion?.parentRunId)
+        ) {
+          // No clear/dispatch callback: denial must not terminate existing native work.
+          yield* Effect.logInfo("orchestration-v2.controlled-codex.continuation-denied", {
+            threadId: request.threadId,
+            providerThreadId: request.providerThreadId,
+          });
+          return;
+        }
         if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
           yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
             threadId: request.threadId,

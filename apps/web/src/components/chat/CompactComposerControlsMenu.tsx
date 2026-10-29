@@ -58,9 +58,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
       <MenuPopup align="start" {...composerFloatingLayerProps}>
         {props.multiAgentLabel && props.onOpenMultiAgentPreferences ? (
           <>
-            <MenuItem onClick={props.onOpenMultiAgentPreferences}>
-              {props.multiAgentLabel} — execution not enabled
-            </MenuItem>
+            <MenuItem onClick={props.onOpenMultiAgentPreferences}>{props.multiAgentLabel}</MenuItem>
             <MenuDivider />
           </>
         ) : null}

@@ -1,5 +1,13 @@
+import { NewRunTrigger } from "./automaticContinuation.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { MultiAgentConfig, DEFAULT_MULTI_AGENT_CONFIG } from "./multiAgent.ts";
+import {
+  MultiAgentControllerState,
+  MultiAgentTaskIdentity,
+  MultiAgentSubmissionClaim,
+  MultiAgentWorkerOwnership,
+} from "./multiAgentController.ts";
+import { ServerProvider } from "./server.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaAST from "effect/SchemaAST";
@@ -551,6 +559,14 @@ export const OrchestrationV2Run = Schema.Struct({
   modelSelection: ModelSelection,
   /** Immutable preference snapshot at run creation. Legacy runs without it are Off. */
   multiAgent: Schema.optional(MultiAgentConfig),
+  /** Reserved for T3-owned orchestration. Absent on ordinary and legacy runs; no enrollment on decode. */
+  multiAgentController: Schema.optional(MultiAgentControllerState),
+  multiAgentControllerRevision: Schema.optional(NonNegativeInt),
+  /** Server-created review run; its controller and lifetime limits remain on the original run. */
+  multiAgentReview: Schema.optional(Schema.Struct({ coordinatorRunId: RunId })),
+  controlledWorkerOwnership: Schema.optional(MultiAgentWorkerOwnership),
+  /** Immutable T3-owned new-run cause. Missing legacy metadata is unknown, never implicitly manual. */
+  newRunTrigger: Schema.optional(NewRunTrigger),
   providerThreadId: Schema.NullOr(ProviderThreadId),
   userMessageId: MessageId,
   rootNodeId: Schema.NullOr(NodeId),
@@ -1747,6 +1763,16 @@ const OrchestrationV2EventBase = Schema.Struct({
 export const OrchestrationV2DomainEvent = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("multi-agent.controller.updated"),
+    runId: RunId,
+    payload: Schema.Struct({
+      state: MultiAgentControllerState,
+      expectedRevision: NonNegativeInt,
+      revision: PositiveInt,
+    }),
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("thread.created"),
     payload: OrchestrationV2AppThread,
   }),
@@ -2569,6 +2595,16 @@ export type OrchestrationV2RawProviderEventJson = typeof OrchestrationV2RawProvi
 export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("multi-agent.controller.updated"),
+    runId: RunId,
+    payload: Schema.Struct({
+      state: MultiAgentControllerState,
+      expectedRevision: NonNegativeInt,
+      revision: PositiveInt,
+    }),
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("thread.created"),
     payload: OrchestrationV2AppThreadJson,
   }),
@@ -3175,6 +3211,61 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  /** T3-owned controller commands. The caller supplies verified source identities and an admission catalog, never MCP/model metadata. */
+  Schema.Struct({
+    type: Schema.Literal("multi-agent.controller.command"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    action: Schema.Union([
+      /** Internal execution intake: all proposal content and identities are read/allocated by T3. */
+      Schema.Struct({
+        type: Schema.Literal("admit_proposal"),
+        proposalItemId: TurnItemId,
+        attemptId: RunAttemptId,
+      }),
+      Schema.Struct({
+        type: Schema.Literal("admit"),
+        proposalId: MessageId,
+        attemptId: RunAttemptId,
+        proposal: Schema.Unknown,
+        identities: Schema.Array(MultiAgentTaskIdentity),
+        providers: Schema.Array(ServerProvider),
+        allowedInstanceIds: Schema.optional(Schema.Array(ProviderInstanceId)),
+      }),
+      Schema.Struct({ type: Schema.Literal("reserve"), taskId: NodeId }),
+      Schema.Struct({ type: Schema.Literal("launch"), taskId: NodeId }),
+      Schema.Struct({
+        type: Schema.Literal("started"),
+        taskId: NodeId,
+        launchCommandId: CommandId,
+        workerThreadId: ThreadId,
+        workerRunId: RunId,
+      }),
+      Schema.Struct({
+        type: Schema.Literal("launch_failed"),
+        taskId: NodeId,
+        launchCommandId: CommandId,
+      }),
+      Schema.Struct({ type: Schema.Literal("cancel") }),
+      Schema.Struct({ type: Schema.Literal("stop_coordinator") }),
+      Schema.Struct({ type: Schema.Literal("review_results") }),
+      /** T3 reports identities only; settlement reads the persisted worker outcome. */
+      Schema.Struct({
+        type: Schema.Literal("worker_finished"),
+        taskId: NodeId,
+        launchCommandId: CommandId,
+        workerThreadId: ThreadId,
+        workerRunId: RunId,
+        workerAttemptId: RunAttemptId,
+      }),
+      Schema.Struct({
+        type: Schema.Literal("commit_submission"),
+        claim: MultiAgentSubmissionClaim,
+      }),
+      Schema.Struct({ type: Schema.Literal("settle") }),
+    ]),
+  }),
   /**
    * Records what a pull request watch saw, and wakes the agent in the same transaction when
    * `wake` is set. Rejected once the watch started at `startedAt` has ended, and a wake is

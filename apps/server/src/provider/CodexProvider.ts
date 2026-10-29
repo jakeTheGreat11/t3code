@@ -231,12 +231,13 @@ export function mapCodexModelCapabilities(
   });
 }
 
-function parseCodexModelListResponse(
+export function parseCodexModelListResponse(
   response: CodexSchema.V2ModelListResponse,
 ): ReadonlyArray<ServerProviderModel> {
   return response.data.map((model) => ({
     slug: model.model,
     name: formatCodexModelName(model.displayName),
+    ...(model.description.trim() ? { description: model.description.trim() } : {}),
     isCustom: false,
     ...(model.isDefault ? { isDefault: true } : {}),
     capabilities: mapCodexModelCapabilities(model),

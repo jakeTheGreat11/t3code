@@ -9,7 +9,7 @@ import {
   resolveWorktreeSetupProgress,
 } from "./ChatView.logic";
 import * as DateTime from "effect/DateTime";
-import { restorePlanFollowUpComposer } from "./ChatView.logic";
+import { restorePlanFollowUpComposer, stoppableCoordinatorRunId } from "./ChatView.logic";
 import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitations";
 import { prepareQueuedEditAttachments, recoverQueuedMessageEdit } from "./chat/queuedMessageEdit";
 import {
@@ -4590,8 +4590,11 @@ export default function ChatView(props: ChatViewProps) {
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
   }, [composerRef]);
+  const coordinatorRunToStop = stoppableCoordinatorRunId(serverProjection?.runs ?? []);
   const canInterruptRunningThread =
-    canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
+    canOperateThread &&
+    (coordinatorRunToStop !== undefined ||
+      deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime));
   const onInterrupt = useCallback(async () => {
     if (
       !activeThread ||
@@ -4600,7 +4603,10 @@ export default function ChatView(props: ChatViewProps) {
       return;
     const result = await interruptThreadTurn({
       environmentId,
-      input: { threadId: activeThread.id },
+      input: {
+        threadId: activeThread.id,
+        ...(coordinatorRunToStop === undefined ? {} : { runId: coordinatorRunToStop }),
+      },
     });
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
       const error = squashAtomCommandFailure(result);
@@ -4609,7 +4615,14 @@ export default function ChatView(props: ChatViewProps) {
         error instanceof Error ? error.message : "Failed to interrupt the current turn.",
       );
     }
-  }, [activeThread, environmentId, interruptThreadTurn, setThreadError]);
+    if (result._tag === "Success" && coordinatorRunToStop !== undefined)
+      toastManager.add({
+        type: "info",
+        title: "Coordinator stopped",
+        description:
+          "New delegation and automatic review are disabled. Already-committed workers may finish.",
+      });
+  }, [activeThread, environmentId, interruptThreadTurn, setThreadError, coordinatorRunToStop]);
   useEffect(() => subscribeSnapShotComposerFocus(focusComposer), [focusComposer]);
   const scheduleComposerFocus = useCallback(() => {
     window.requestAnimationFrame(() => {
@@ -11515,6 +11528,7 @@ export default function ChatView(props: ChatViewProps) {
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
+                controllerRuns={paintOnlyDisplayedTimeline ? [] : (serverProjection?.runs ?? [])}
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
                 citationHistoryLoading={threadDetailLoading}
                 {...(!paintOnlyDisplayedTimeline
@@ -11748,6 +11762,11 @@ export default function ChatView(props: ChatViewProps) {
                               }
                               phase={phase}
                               canInterrupt={canInterruptRunningThread}
+                              interruptLabel={
+                                coordinatorRunToStop === undefined
+                                  ? "Stop generation"
+                                  : "Stop coordinator"
+                              }
                               isConnecting={isConnecting}
                               isSendBusy={
                                 (isSendBusy && !sendQueuesBehindSetup) ||

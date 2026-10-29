@@ -97,7 +97,7 @@ import {
 } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import {
   type BackgroundWork,
   type BackgroundWorkReport,
@@ -1500,6 +1500,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
       : mcpSessions.read(threadId).pipe(Effect.map((session) => acpMcpContext(session, self)));
   const driver = flavor.driver;
   const continuationRequests = options.continuationRequests;
+  const continuationEmitter = yield* ProviderContinuationRequests.makeContinuationEmitter(
+    options.instanceId,
+    continuationRequests,
+  );
   const postSettleContinuationEnabled =
     flavor.enablePostSettleContinuation === true && continuationRequests !== undefined;
 
@@ -1511,6 +1515,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
+        const sessionEmitter = yield* continuationEmitter.forSession(input.providerSessionId);
         // Persisted ACP threads from before item identity v2 retain their old
         // deterministic ids. Fresh threads scope native ids by instance so
         // separately configured agents cannot collide.
@@ -3745,7 +3750,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             threadId: route.threadId,
             providerThreadId: route.providerThreadId,
           });
-          yield* continuationRequests.offer({
+          yield* sessionEmitter.offer({
             threadId: route.threadId,
             providerThreadId: route.providerThreadId,
             driver,
@@ -7317,6 +7322,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         );
 
         const sessionRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          continuationEmitterIdentity: sessionEmitter.identity,
           instanceId: options.instanceId,
           driver,
           providerSessionId: input.providerSessionId,

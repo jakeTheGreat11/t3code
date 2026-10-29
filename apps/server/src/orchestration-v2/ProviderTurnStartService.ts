@@ -1,4 +1,7 @@
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { controlledCodexQueuedStartBlocked } from "./ControlledCodexContinuation.ts";
+import { multiAgentCoordinatorInstructions } from "./MultiAgentCoordinatorInstructions.ts";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
@@ -9,6 +12,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
+  type TurnItemId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -25,6 +29,9 @@ import * as Schema from "effect/Schema";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { multiAgentCodexEligibility } from "./MultiAgentCodexEligibility.ts";
+import { resolvePersistedMultiAgentTask } from "@t3tools/shared/multiAgentRouting";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
@@ -43,6 +50,11 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import {
+  withControlledWorkerSubmission,
+  ControlledWorkerExecutionDisabled,
+} from "./ControlledWorkerSubmission.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
   isRestartNoteContinuation,
@@ -86,6 +98,7 @@ export class ProviderTurnStartServiceV2 extends Context.Service<
 export const layer: Layer.Layer<
   ProviderTurnStartServiceV2,
   never,
+  | Orchestrator.OrchestratorV2
   | EventSink.EventSinkV2
   | ContextHandoffService.ContextHandoffServiceV2
   | IdAllocator.IdAllocatorV2
@@ -100,6 +113,10 @@ export const layer: Layer.Layer<
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const controlledWorkerExecutionDisabled = yield* ControlledWorkerExecutionDisabled;
+    const providerRegistry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
+    const reviewExecutor = yield* Effect.serviceOption(ThreadCommandExecutor.ThreadCommandExecutor);
     const eventSink = yield* EventSink.EventSinkV2;
     const contextHandoffService = yield* ContextHandoffService.ContextHandoffServiceV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -130,9 +147,17 @@ export const layer: Layer.Layer<
       // so the caller fails the start or the run instead of skipping it.
       const isCurrentAttemptInStatus = (expectedStatus: OrchestrationV2Run["status"]) =>
         projectionStore.getRuntimeRecoveryProjection(input.threadId).pipe(
-          Effect.map((current) => {
+          Effect.flatMap((current) => {
             const run = current.runs.find((candidate) => candidate.id === input.runId);
-            return run?.activeAttemptId === input.attemptId && run.status === expectedStatus;
+            if (run?.activeAttemptId !== input.attemptId || run.status !== expectedStatus)
+              return Effect.succeed(false);
+            return run.controlledWorkerOwnership || run.ordinal === 1
+              ? projectionStore.controlledWorkerStartAllowed(
+                  input.threadId,
+                  input.runId,
+                  input.attemptId,
+                )
+              : Effect.succeed(true);
           }),
         );
       return {
@@ -229,6 +254,114 @@ export const layer: Layer.Layer<
       if (run.status !== "starting") {
         // The effect is idempotent once the run has advanced or terminalized.
         return;
+      }
+      const controllerRunId = run.multiAgentReview?.coordinatorRunId ?? run.id;
+      const coordinatorRun = run.multiAgentReview
+        ? projection.runs.find((row) => row.id === controllerRunId)
+        : run;
+      if (run.multiAgentReview) {
+        const review = coordinatorRun?.multiAgentController?.reviews?.find(
+          (row) => row.runId === run.id,
+        );
+        if (
+          !coordinatorRun ||
+          !review ||
+          review.submissionClaimedAt ||
+          review.attemptId !== run.activeAttemptId ||
+          coordinatorRun?.multiAgentController?.coordinatorStoppedAt ||
+          !modelSelectionsEqual(coordinatorRun.modelSelection, run.modelSelection)
+        )
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause:
+              "Review is stopped, stale, or already submitted; uncertain submissions are never retried.",
+          });
+      }
+      if (controlledCodexQueuedStartBlocked(projection, run)) {
+        return yield* new ProviderTurnStartError({
+          runId,
+          cause: "Controlled Codex workers cannot execute automatic follow-up runs.",
+        });
+      }
+      if (run.controlledWorkerOwnership && controlledWorkerExecutionDisabled) {
+        // A closed boundary is not termination evidence. Preserve the reservation.
+        yield* Effect.logDebug("Controlled worker provider start remains gated", { runId });
+        return;
+      }
+      const owner = run.controlledWorkerOwnership;
+      if (owner) {
+        if (
+          !projection.providerThreads.some(
+            (row) => row.id === owner.providerThreadId && row.driver === "codex",
+          )
+        )
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: "Controlled workers require a verified Codex binding.",
+          });
+        const initialMessage = projection.messages.find((row) => row.id === run.userMessageId);
+        if (initialMessage && /^\/goal(?:\s|$)/iu.test(initialMessage.text.trim()))
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: "Native Codex goals are unsupported for single-use controlled workers.",
+          });
+        const coordinator = yield* projectionStore.getThreadRecords(
+          owner.coordinatorThreadId,
+          ["runs", "attempts"],
+          {
+            runIds: [owner.coordinatorRunId],
+          },
+        );
+        const coordinatorRun = coordinator.runs.find((row) => row.id === owner.coordinatorRunId);
+        const task = coordinatorRun?.multiAgentController?.tasks.find(
+          (row) => row.taskId === owner.taskId,
+        );
+        // Check BEFORE reopening/resuming native state. A saved grant is an
+        // uncertain submission, never permission for another executor.
+        if (
+          !task ||
+          task.submissionCommitment ||
+          run.activeAttemptId !== owner.workerAttemptId ||
+          !(yield* projectionStore.controlledWorkerStartAllowed(
+            input.threadId,
+            run.id,
+            owner.workerAttemptId,
+          ))
+        )
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: "Controlled Codex submission is already committed or its ownership is stale.",
+          });
+        if (Option.isNone(providerRegistry) || !coordinatorRun)
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: "Controlled worker catalog or coordinator is unavailable.",
+          });
+        const catalog = yield* providerRegistry.value.getProviders.pipe(
+          Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
+        );
+        const eligibility = multiAgentCodexEligibility(coordinatorRun, catalog);
+        const selected = resolvePersistedMultiAgentTask(coordinatorRun, task, {
+          providers: catalog,
+        });
+        if (
+          !eligibility.eligible ||
+          selected.status !== "resolved" ||
+          !modelSelectionsEqual(selected.modelSelection, run.modelSelection) ||
+          !modelSelectionsEqual(selected.modelSelection, task.modelSelection) ||
+          (run.multiAgent?.mode ?? "off") !== "off" ||
+          !coordinator.attempts.some(
+            (attempt) =>
+              attempt.id === coordinatorRun.multiAgentController?.coordinatorAttemptId &&
+              attempt.attemptOrdinal === 1 &&
+              attempt.runId === coordinatorRun.id &&
+              attempt.providerInstanceId === coordinatorRun.providerInstanceId,
+          )
+        )
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: `Controlled worker production eligibility rejected: ${eligibility.eligible ? "assignment_or_attempt_mismatch" : eligibility.reason}.`,
+          });
       }
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
@@ -516,6 +649,7 @@ export const layer: Layer.Layer<
         inheritedBackgroundTurnItems,
       });
       const { isCurrentAttemptInStatus } = runControls;
+      if (!(yield* isCurrentAttemptInStatus("starting"))) return;
 
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
         thread: projection.thread,
@@ -586,7 +720,18 @@ export const layer: Layer.Layer<
         });
         return;
       }
-      const session = sessionResult.success;
+      if (run.controlledWorkerOwnership && sessionResult.success.driver !== "codex")
+        return yield* new ProviderTurnStartError({
+          runId,
+          cause: "Controlled workers require a Codex runtime.",
+        });
+      const session = withControlledWorkerSubmission(
+        sessionResult.success,
+        run,
+        projectionStore,
+        orchestrator,
+        providerSessions,
+      );
       // Only the provider's own thread load fails the run on the last attempt;
       // store, id and handoff failures around it keep their typed errors.
       const loadFromProvider = (
@@ -1089,6 +1234,40 @@ export const layer: Layer.Layer<
                 !coveredItemIds.has(item.id) &&
                 historicalMessage(item) !== null,
             );
+      // Rebuild provider-only context from durable state on each start. Never
+      // append guidance to stored messages or the runtime shared with workers.
+      let coordinatorInstructions = "";
+      if (
+        coordinatorRun &&
+        (coordinatorRun.multiAgent?.mode === "custom" ||
+          coordinatorRun.multiAgent?.mode === "auto") &&
+        !run.controlledWorkerOwnership &&
+        (run.multiAgentReview || run.multiAgentController?.coordinatorAttemptId === attempt.id) &&
+        attempt.attemptOrdinal === 1 &&
+        runningProviderThread.driver === "codex" &&
+        session.driver === "codex" &&
+        Option.isSome(providerRegistry)
+      ) {
+        const current = (yield* projectionStore.getThreadRecords(run.threadId, ["runs"], {
+          runIds: [controllerRunId],
+        })).runs.find((candidate) => candidate.id === controllerRunId);
+        if (
+          current &&
+          current.multiAgentController?.status === "open" &&
+          current.multiAgentController.coordinatorStoppedAt === undefined &&
+          (run.multiAgentReview ||
+            current.multiAgentController.coordinatorAttemptId === attempt.id) &&
+          multiAgentCodexEligibility(current, yield* providerRegistry.value.getProviders).eligible
+        )
+          coordinatorInstructions =
+            multiAgentCoordinatorInstructions(current) +
+            (run.multiAgentReview
+              ? "\nYou are reviewing the results for the ORIGINAL controller. Completed task keys and assignments must not be repeated. Review worker outputs, integrate and test, then deliver a final answer. Additional justified tasks share the original four-task limit.\nExisting tasks: " +
+                current.multiAgentController.tasks
+                  .map((task) => `${task.key}: ${task.status}; thread=${task.workerThreadId}`)
+                  .join("\n")
+              : "");
+      }
       const startWithHandoffs = (
         turnInput: Parameters<typeof session.startTurn>[0],
         compact = false,
@@ -1168,12 +1347,12 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, restartNote]
+          const context = [coordinatorInstructions, delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           // A note continuation has no turn to resume; its text is the prompt.
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
-          yield* start({
+          const submission = start({
             ...(noteContinuation ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
@@ -1194,6 +1373,68 @@ export const layer: Layer.Layer<
                 : Effect.void,
             ),
           );
+          if (!run.multiAgentReview) yield* submission;
+          else {
+            if (Option.isNone(reviewExecutor))
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Review serialization is unavailable.",
+              });
+            // Codex startTurn returns after the submit handshake, not after execution.
+            // Stop and submission have one ordering; no coordinator lock spans model execution.
+            yield* reviewExecutor.value.withLock(
+              run.threadId,
+              Effect.gen(function* () {
+                const current = yield* projectionStore.getThreadRecords(run.threadId, ["runs"]);
+                const root = current.runs.find((row) => row.id === controllerRunId);
+                const state = root?.multiAgentController;
+                const review = state?.reviews?.find((row) => row.runId === run.id);
+                const execution = current.runs.find((row) => row.id === run.id);
+                if (
+                  !root ||
+                  !state ||
+                  state.status !== "open" ||
+                  state.coordinatorStoppedAt ||
+                  !review ||
+                  review.submissionClaimedAt ||
+                  review.attemptId !== attempt.id ||
+                  execution?.activeAttemptId !== attempt.id ||
+                  execution.status !== "running" ||
+                  current.runs.some((row) => row.ordinal > execution.ordinal) ||
+                  session.driver !== "codex"
+                )
+                  return yield* new ProviderTurnStartError({
+                    runId,
+                    cause: "Review submission is no longer authorized.",
+                  });
+                const now = yield* DateTime.now;
+                yield* eventSink.write({
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({ threadId: run.threadId }),
+                      type: "multi-agent.controller.updated",
+                      threadId: run.threadId,
+                      runId: root.id,
+                      occurredAt: now,
+                      payload: {
+                        expectedRevision: root.multiAgentControllerRevision ?? 0,
+                        revision: (root.multiAgentControllerRevision ?? 0) + 1,
+                        state: {
+                          ...state,
+                          reviews: state.reviews!.map((row) =>
+                            row.runId === run.id
+                              ? { ...row, submissionClaimedAt: DateTime.formatIso(now) }
+                              : row,
+                          ),
+                        },
+                      },
+                    },
+                  ],
+                });
+                yield* submission;
+              }),
+            );
+          }
           // The provider already accepted the turn. A stale pending marker
           // can force a fresh thread later, but must not stop live ingestion.
           yield* delivery.delivered.pipe(
@@ -1221,6 +1462,7 @@ export const layer: Layer.Layer<
         effectiveHandoffs.length === 0 &&
         missedItems.length === 0 &&
         restartNote === "" &&
+        coordinatorInstructions === "" &&
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
@@ -1235,6 +1477,36 @@ export const layer: Layer.Layer<
         providerThread: runningProviderThread,
         attempt: runningAttempt,
         attemptId: attempt.id,
+        ...((run.multiAgentReview ||
+          run.multiAgent?.mode === "custom" ||
+          run.multiAgent?.mode === "auto") &&
+        (run.multiAgentReview || run.multiAgentController?.coordinatorAttemptId === attempt.id) &&
+        runningProviderThread.driver === "codex" &&
+        !run.controlledWorkerOwnership
+          ? {
+              onTaskProposal: (proposalItemId: TurnItemId) =>
+                orchestrator
+                  .dispatch({
+                    type: "multi-agent.controller.command",
+                    commandId: CommandId.make(
+                      `command:multi-agent:proposal:${[run.threadId, run.id, attempt.id, proposalItemId].map(encodeURIComponent).join(":")}`,
+                    ),
+                    threadId: run.threadId,
+                    runId: controllerRunId,
+                    action: { type: "admit_proposal", attemptId: attempt.id, proposalItemId },
+                  })
+                  .pipe(
+                    Effect.asVoid,
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("Multi-Agent proposal rejected", {
+                        runId: run.id,
+                        proposalItemId,
+                        cause,
+                      }),
+                    ),
+                  ),
+            }
+          : {}),
         loadInheritedBackgroundTurnItems: runControls.loadInheritedBackgroundTurnItems,
         relatedThreadIds: routableSubagents.flatMap((subagent) =>
           subagent.childThreadId === null ? [] : [subagent.childThreadId],

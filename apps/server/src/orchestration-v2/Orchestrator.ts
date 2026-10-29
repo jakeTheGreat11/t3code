@@ -3,7 +3,30 @@ import type {
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
 } from "@t3tools/contracts";
-import { snapshotMultiAgentConfig } from "@t3tools/shared/multiAgentRouting";
+import {
+  snapshotMultiAgentConfig,
+  resolveMultiAgentRouting,
+  validateModelSelection,
+  createMultiAgentAutoCatalog,
+  resolvePersistedMultiAgentTask,
+} from "@t3tools/shared/multiAgentRouting";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { ControlledWorkerExecutionDisabled } from "./ControlledWorkerSubmission.ts";
+import { multiAgentCodexEligibility } from "./MultiAgentCodexEligibility.ts";
+import {
+  ControlledWorkerLaunchOwner,
+  controlledWorkerOwnershipProblem,
+} from "./ControlledWorkerOwnership.ts";
+import {
+  admitMultiAgentProposal,
+  cancelMultiAgentController,
+  settleMultiAgentController,
+  stopMultiAgentCoordinator,
+  grantMultiAgentSubmission,
+  transitionMultiAgentTask,
+  multiAgentTaskOccupiesCapacity,
+  multiAgentReviewDecision,
+} from "@t3tools/shared/multiAgentController";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -23,8 +46,11 @@ import {
   CommandId,
   isProviderNativeSubagentThread,
   MessageId,
-  type NodeId,
+  NodeId,
+  MultiAgentProposal,
+  MULTI_AGENT_CONTROLLER_LIMITS,
   type ModelSelection,
+  type MultiAgentWorkerOwnership,
   OrchestrationV2Command,
   type OrchestrationV2InternalCommand,
   type OrchestrationV2ServerCommand,
@@ -60,9 +86,14 @@ import {
   RuntimeMode,
   ThreadLinkedPullRequest,
   ThreadId,
-  type TurnItemId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import {
+  controlledCodexDispatchBlocked,
+  controlledCodexOriginBlocked,
+  controlledCodexQueuedStartBlocked,
+} from "./ControlledCodexContinuation.ts";
 import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
@@ -272,6 +303,8 @@ export const OrchestratorV2Error = Schema.Union([
 export type OrchestratorV2Error = typeof OrchestratorV2Error.Type;
 
 export interface OrchestratorV2DispatchResult {
+  /** Internal commitment commands only. Receipt replay never grants another invocation. */
+  readonly submissionCommitmentGranted?: boolean;
   readonly sequence: number;
   readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
 }
@@ -294,6 +327,12 @@ export interface OrchestratorV2Shape {
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
+  /** Existing outbox driver; no polling, provider calls, or independent admission rules. */
+  readonly scheduleMultiAgentWorkers: (input: {
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly schedulingId: CommandId;
+  }) => Effect.Effect<void, OrchestratorV2Error>;
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
   ) => Stream.Stream<OrchestrationV2SearchThreadResult, OrchestratorV2Error>;
@@ -375,6 +414,31 @@ export class OrchestratorV2 extends Context.Service<OrchestratorV2, Orchestrator
   "t3/orchestration-v2/Orchestrator/OrchestratorV2",
 ) {}
 
+export function controlledWorkerFinishedCommand(owner: MultiAgentWorkerOwnership) {
+  return {
+    type: "multi-agent.controller.command",
+    commandId: CommandId.make(
+      `command:multi-agent:worker-finished:${[
+        owner.launchCommandId,
+        owner.workerRunId,
+        owner.workerAttemptId,
+      ]
+        .map(encodeURIComponent)
+        .join(":")}`,
+    ),
+    threadId: owner.coordinatorThreadId,
+    runId: owner.coordinatorRunId,
+    action: {
+      type: "worker_finished",
+      taskId: owner.taskId,
+      launchCommandId: owner.launchCommandId,
+      workerThreadId: owner.workerThreadId,
+      workerRunId: owner.workerRunId,
+      workerAttemptId: owner.workerAttemptId,
+    },
+  } as const;
+}
+
 function nextRunOrdinal(projection: Pick<OrchestrationV2ThreadProjection, "runs">): number {
   return projection.runs.length + 1;
 }
@@ -434,6 +498,7 @@ const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLin
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
   switch (command.type) {
+    case "multi-agent.controller.command":
     case "thread.create":
     case "thread.archive":
     case "thread.unarchive":
@@ -803,6 +868,8 @@ function lastDeliveredRunForProviderThread(
   );
 }
 
+const decodeTaskProposal = Schema.decodeUnknownEffect(Schema.fromJsonString(MultiAgentProposal));
+
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
@@ -832,6 +899,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const providerAdapters = yield* ProviderAdapterRegistryV2;
+  // Legacy hosts without a catalog retain Off behavior; enrollment fails closed.
+  const providerRegistry = yield* Effect.serviceOption(ProviderRegistry.ProviderRegistry);
+  const controlledWorkerExecutionDisabled = yield* ControlledWorkerExecutionDisabled;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
@@ -1077,6 +1147,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return;
       }
       yield* continuationRequests.offer({
+        emitterIdentity: { type: "unknown", reason: "not_runtime_owned" },
         threadId,
         providerThreadId: providerThread.id,
         driver: providerThread.driver,
@@ -1307,6 +1378,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (queuedRun === undefined) {
         return;
       }
+      if (controlledCodexQueuedStartBlocked(projection, queuedRun)) return;
       // A provider that just failed will likely fail the next message too.
       // Hold the queue so the user decides when to resume it. Validation
       // failures (setup, unsupported handoff) belong to that message alone,
@@ -4518,9 +4590,60 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    // Private authority, supplied only by the locked controller review_results action.
+    reviewControllerRunId?: RunId,
   ) =>
     Effect.gen(function* () {
       let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      const controlledOwner = yield* ControlledWorkerLaunchOwner;
+      if (reviewControllerRunId !== undefined) {
+        const root = projection.runs.find((run) => run.id === reviewControllerRunId);
+        if (
+          !root ||
+          root.controlledWorkerOwnership ||
+          multiAgentReviewDecision(root, projection.runs) !== "review"
+        )
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Automatic review authority is stale.",
+          });
+      }
+
+      const manualWorkerFollowup =
+        !controlledOwner &&
+        command.createdBy === "user" &&
+        command.restartContinuationOfRunId === undefined &&
+        command.usageLimitContinuationOfRunId === undefined &&
+        command.delegatedCompletion === undefined &&
+        command.notification === undefined &&
+        command.scheduledTaskId === undefined &&
+        controlledCodexOriginBlocked(projection);
+      if (
+        !controlledOwner &&
+        reviewControllerRunId === undefined &&
+        controlledCodexDispatchBlocked(projection, command)
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Controlled Codex workers cannot create automatic follow-up runs.",
+        });
+      if (
+        controlledOwner &&
+        (projection.runs.length !== 0 ||
+          command.dispatchMode.type !== "defer_start" ||
+          controlledOwner.workerThreadId !== command.threadId ||
+          controlledOwner.launchMessageId !== command.messageId ||
+          command.commandId !==
+            CommandId.make(`${controlledOwner.launchCommandId}:initial-message`) ||
+          projection.thread.coordinatorThreadId !== controlledOwner.coordinatorThreadId)
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Controlled dispatch must create the exact initial worker run.",
+        });
       if (command.manualContinuationOfRunId !== undefined) {
         const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
         const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -5026,6 +5149,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ),
               );
         const run: OrchestrationV2Run = {
+          ...(manualWorkerFollowup ? { newRunTrigger: { type: "manual" } as const } : {}),
           multiAgent: snapshotMultiAgentConfig(command.multiAgent),
           id: runId,
           threadId: command.threadId,
@@ -5379,6 +5503,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   mapDispatchError(command),
                 );
         const run: OrchestrationV2Run = {
+          ...(manualWorkerFollowup ? { newRunTrigger: { type: "manual" } as const } : {}),
           multiAgent: snapshotMultiAgentConfig(command.multiAgent),
           id: runId,
           threadId: command.threadId,
@@ -5390,6 +5515,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           rootNodeId,
           activeAttemptId: attemptId,
           status: dispatchMode.type === "defer_start" ? "preparing" : "starting",
+          ...(controlledOwner === undefined
+            ? {}
+            : {
+                controlledWorkerOwnership: {
+                  ...controlledOwner,
+                  workerRunId: runId,
+                  workerAttemptId: attemptId,
+                  providerInstanceId: modelSelection.instanceId,
+                  providerThreadId,
+                  providerSessionId,
+                },
+              }),
           queuePosition: null,
           requestedAt: now,
           startedAt: null,
@@ -6072,6 +6209,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         );
       const run: OrchestrationV2Run = {
+        ...(manualWorkerFollowup ? { newRunTrigger: { type: "manual" } as const } : {}),
         multiAgent: snapshotMultiAgentConfig(command.multiAgent),
         id: runId,
         threadId: command.threadId,
@@ -9086,7 +9224,30 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           turnItemStatuses: ["pending", "running", "waiting"],
         },
       );
+      const requestedRun = projection.runs.find((candidate) => candidate.id === command.runId);
+      const reviewId = requestedRun?.multiAgentController?.reviews?.at(-1)?.runId;
+      const activeReview = projection.runs.find(
+        (candidate) =>
+          candidate.id === reviewId &&
+          ["queued", "preparing", "starting", "running", "waiting"].includes(candidate.status),
+      );
+      if (activeReview) command = { ...command, runId: activeReview.id };
       const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      if (run?.multiAgentController !== undefined || run?.multiAgentReview !== undefined) {
+        // The desktop Stop button dispatches run.interrupt directly. The barrier
+        // shares this command's coordinator lock and transaction with interruption.
+        yield* dispatchMultiAgentController(
+          {
+            type: "multi-agent.controller.command",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            runId: run.multiAgentReview?.coordinatorRunId ?? run.id,
+            action: { type: "stop_coordinator" },
+          },
+          events,
+          effects,
+        );
+      }
       const rootNode =
         run?.rootNodeId === null
           ? undefined
@@ -9104,6 +9265,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           activeProviderThreadId: projection.thread.activeProviderThreadId,
           runs: projection.runs,
         }).length > 0;
+      if (
+        run?.multiAgentController !== undefined &&
+        !hasBackgroundWork &&
+        ["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(run.status)
+      )
+        return undefined;
       // A failed start has no provider turn. Background work still belongs
       // to the provider thread, so Stop reaches its latest accepted turn.
       const providerTurn =
@@ -10583,6 +10750,554 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
   });
 
+  const dispatchMultiAgentController = Effect.fn("orchestrationV2.dispatch.multiAgentController")(
+    function* (
+      command: Extract<OrchestrationV2ServerCommand, { type: "multi-agent.controller.command" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    ) {
+      const sourceItem =
+        command.action.type === "admit_proposal"
+          ? yield* mapDispatchError(command)(
+              projectionStore.getTurnItem({
+                threadId: command.threadId,
+                itemId: command.action.proposalItemId,
+              }),
+            )
+          : null;
+      const projection = yield* mapDispatchError(command)(
+        projectionStore.getThreadRecords(
+          command.threadId,
+          command.action.type === "admit_proposal"
+            ? ["runs", "attempts", "messages", "providerTurns", "providerThreads"]
+            : command.action.type === "admit"
+              ? ["runs", "attempts", "messages"]
+              : ["runs"],
+          {
+            ...(sourceItem?.type === "assistant_message"
+              ? { messageIds: [sourceItem.messageId] }
+              : {}),
+            ...(command.action.type === "admit" ? { messageIds: [command.action.proposalId] } : {}),
+          },
+        ),
+      );
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const reject = (reason: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: reason,
+        });
+      if (!run) return yield* reject("Coordinator run does not belong to the specified thread.");
+      let state = run.multiAgentController;
+      let action = command.action;
+      if (action.type === "admit_proposal") {
+        const execution = projection.runs.find((candidate) => candidate.id === sourceItem?.runId);
+        const review = state?.reviews?.find((candidate) => candidate.runId === execution?.id);
+        const attemptId = action.attemptId;
+        const attempt = projection.attempts.find((candidate) => candidate.id === attemptId);
+        const providerThread = projection.providerThreads.find(
+          (candidate) => candidate.id === execution?.providerThreadId,
+        );
+        const turn = projection.providerTurns.find(
+          (candidate) => candidate.id === sourceItem?.providerTurnId,
+        );
+        const message =
+          sourceItem?.type === "assistant_message"
+            ? projection.messages.find((candidate) => candidate.id === sourceItem.messageId)
+            : undefined;
+        if (
+          (run.multiAgent?.mode !== "custom" && run.multiAgent?.mode !== "auto") ||
+          run.controlledWorkerOwnership !== undefined ||
+          !state ||
+          state.coordinatorRunId !== run.id ||
+          state.coordinatorThreadId !== command.threadId ||
+          (review?.attemptId ?? state.coordinatorAttemptId) !== action.attemptId ||
+          execution?.activeAttemptId !== action.attemptId ||
+          execution.status !== "running" ||
+          state.status !== "open" ||
+          state.coordinatorStoppedAt !== undefined ||
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          !attempt ||
+          attempt.runId !== execution.id ||
+          attempt.reason !== "initial" ||
+          attempt.attemptOrdinal !== 1 ||
+          attempt.status !== "running" ||
+          !providerThread ||
+          providerThread.driver !== "codex" ||
+          providerThread.providerInstanceId !== run.providerInstanceId ||
+          !turn ||
+          turn.runAttemptId !== attempt.id ||
+          turn.nodeId !== execution.rootNodeId ||
+          turn.providerThreadId !== providerThread.id ||
+          turn.status !== "running" ||
+          sourceItem?.type !== "assistant_message" ||
+          sourceItem.threadId !== command.threadId ||
+          sourceItem.runId !== execution.id ||
+          sourceItem.providerThreadId !== providerThread.id ||
+          sourceItem.status !== "completed" ||
+          sourceItem.streaming ||
+          !message ||
+          message.threadId !== command.threadId ||
+          message.runId !== execution.id ||
+          message.nodeId !== sourceItem.nodeId ||
+          message.role !== "assistant" ||
+          message.createdBy !== "agent" ||
+          message.creationSource !== "provider" ||
+          message.streaming ||
+          message.text !== sourceItem.text
+        )
+          return yield* reject(
+            "Proposal is not from the active initialized coordinator's initial execution.",
+          );
+        const adapter = yield* providerAdapters
+          .get(run.providerInstanceId)
+          .pipe(mapDispatchError(command));
+        if (adapter.driver !== "codex" || Option.isNone(providerRegistry))
+          return yield* reject("Proposal provider or catalog is unsupported.");
+        const proposal = yield* decodeTaskProposal(message.text, {
+          onExcessProperty: "error",
+        }).pipe(Effect.mapError(() => reject("Malformed Multi-Agent task proposal.")));
+        const sourceIdentity = [command.threadId, run.id, attempt.id, sourceItem.id]
+          .map(encodeURIComponent)
+          .join(":");
+        action = {
+          type: "admit",
+          proposalId: message.id,
+          attemptId: attempt.id,
+          proposal,
+          providers: yield* providerRegistry.value.getProviders,
+          identities: proposal.tasks.map((task, index) => ({
+            key: task.key,
+            taskId: NodeId.make(`multi-agent:task:${sourceIdentity}:${index}`),
+            launchCommandId: CommandId.make(`multi-agent:launch:${sourceIdentity}:${index}`),
+            launchMessageId: MessageId.make(`multi-agent:message:${sourceIdentity}:${index}`),
+            workerThreadId: ThreadId.make(`multi-agent:worker:${sourceIdentity}:${index}`),
+          })),
+        };
+      }
+      if (action.type === "admit") {
+        if (
+          (state?.coordinatorAttemptId !== undefined &&
+            state.coordinatorAttemptId !== action.attemptId &&
+            !state.reviews?.some((review) => review.attemptId === action.attemptId)) ||
+          !projection.attempts.some(
+            (attempt) =>
+              attempt.id === action.attemptId &&
+              (attempt.runId === run.id ||
+                state?.reviews?.some(
+                  (review) => review.runId === attempt.runId && review.attemptId === attempt.id,
+                )),
+          ) ||
+          !projection.messages.some(
+            (message) =>
+              message.id === action.proposalId &&
+              (message.runId === run.id ||
+                state?.reviews?.some(
+                  (review) =>
+                    review.runId === message.runId && review.attemptId === action.attemptId,
+                )) &&
+              message.role === "assistant",
+          )
+        ) {
+          return yield* reject("Proposal source does not belong to the coordinator run.");
+        }
+        const result = admitMultiAgentProposal({
+          run,
+          source: { proposalId: action.proposalId, attemptId: action.attemptId },
+          ...(state === undefined ? {} : { state }),
+          proposal: action.proposal,
+          identities: action.identities,
+          catalog: {
+            providers: action.providers,
+            ...(action.allowedInstanceIds === undefined
+              ? {}
+              : { allowedInstanceIds: action.allowedInstanceIds }),
+          },
+        });
+        if (result.status === "rejected")
+          return yield* reject(
+            `Multi-Agent admission rejected: ${result.reason}${result.routing?.status === "unavailable" ? ` (${result.routing.issue.reason})` : ""}.`,
+          );
+        state = result.state;
+      } else {
+        if (!state) return yield* reject("Coordinator run has no Multi-Agent controller.");
+        if (state.coordinatorRunId !== run.id || state.coordinatorThreadId !== command.threadId)
+          return yield* reject("Controller run identity does not match its projection.");
+        if (action.type === "cancel") state = cancelMultiAgentController(state);
+        else if (action.type === "stop_coordinator")
+          state = stopMultiAgentCoordinator(state, DateTime.formatIso(yield* DateTime.now));
+        else if (action.type === "review_results") {
+          const decision = multiAgentReviewDecision(
+            { ...run, multiAgentController: state },
+            projection.runs,
+          );
+          if (decision === "none") return;
+          if (decision === "settle") state = { ...state, status: "settled" };
+          else {
+            if (projection.thread.archivedAt || projection.thread.deletedAt)
+              return yield* reject("Cannot review an archived or deleted coordinator.");
+            const delivered = new Set(state.reviews?.flatMap((review) => review.taskIds) ?? []);
+            const batch = state.tasks.filter((task) => !delivered.has(task.taskId));
+            const messageId = MessageId.make(`multi-agent:review:${run.id}:${state.tasks.length}`);
+            yield* dispatchMessage(
+              {
+                type: "message.dispatch",
+                commandId: command.commandId,
+                threadId: command.threadId,
+                messageId,
+                text: `Your delegated work has settled. Review these exact worker results using thread-read, integrate and verify the combined work, and answer the user. Do not repeat completed assignments. Worker failure is a result to handle, not permission to retry it automatically.\n${batch.map((task) => `${task.key}: ${task.status}; thread=${task.workerThreadId}; initial run=${"workerRunId" in task ? task.workerRunId : "not launched"}`).join("\n")}`,
+                attachments: [],
+                modelSelection: run.modelSelection,
+                multiAgent: { mode: "off" },
+                createdBy: "agent",
+                creationSource: "server",
+                dispatchMode: { type: "queue_after_active" },
+              },
+              events,
+              effects,
+              run.id,
+            );
+            const reviewRun = (yield* Ref.get(events)).find(
+              (event) => event.type === "run.created" && event.payload.userMessageId === messageId,
+            );
+            if (
+              !reviewRun ||
+              reviewRun.type !== "run.created" ||
+              !reviewRun.payload.activeAttemptId
+            )
+              return yield* reject("Review initial execution was not created.");
+            yield* Ref.update(events, (pending) =>
+              pending.map((event) =>
+                event.type === "run.created" && event.payload.id === reviewRun.payload.id
+                  ? {
+                      ...event,
+                      payload: { ...event.payload, multiAgentReview: { coordinatorRunId: run.id } },
+                    }
+                  : event,
+              ),
+            );
+            state = {
+              ...state,
+              reviews: [
+                ...(state.reviews ?? []),
+                {
+                  runId: reviewRun.payload.id,
+                  attemptId: reviewRun.payload.activeAttemptId,
+                  taskIds: batch.map((task) => task.taskId),
+                },
+              ],
+            };
+          }
+        } else if (action.type === "commit_submission") {
+          const claim = action.claim;
+          if (claim.invocationClaimId !== command.commandId)
+            return yield* reject("Submission claim must use its own unique command identity.");
+          const worker = yield* mapDispatchError(command)(
+            projectionStore.getThreadRecords(
+              claim.workerThreadId,
+              ["runs", "attempts", "providerThreads"],
+              { runIds: [claim.workerRunId] },
+            ),
+          );
+          const workerRun = worker.runs.find((candidate) => candidate.id === claim.workerRunId);
+          const attempt = worker.attempts.find(
+            (candidate) => candidate.id === claim.workerAttemptId,
+          );
+          const providerThread = worker.providerThreads.find(
+            (candidate) => candidate.id === claim.providerThreadId,
+          );
+          if (
+            !workerRun ||
+            controlledWorkerOwnershipProblem(run, worker.thread, workerRun) ||
+            (
+              [
+                "coordinatorThreadId",
+                "coordinatorRunId",
+                "taskId",
+                "workerThreadId",
+                "workerRunId",
+                "workerAttemptId",
+                "providerInstanceId",
+                "providerThreadId",
+                "providerSessionId",
+              ] as const
+            ).some((field) => workerRun.controlledWorkerOwnership?.[field] !== claim[field]) ||
+            !attempt ||
+            !providerThread ||
+            worker.thread.projectId !== projection.thread.projectId
+          )
+            return yield* reject("Submission worker binding is missing or stale.");
+          const result = grantMultiAgentSubmission(
+            state,
+            { ...claim, committedAt: DateTime.formatIso(yield* DateTime.now) },
+            { thread: worker.thread, run: workerRun, attempt, providerThread },
+          );
+          if (result.status === "rejected")
+            return yield* reject(`Submission commitment rejected: ${result.reason}.`);
+          state = result.state;
+        } else if (action.type === "worker_finished") {
+          const task = state.tasks.find((candidate) => candidate.taskId === action.taskId);
+          if (
+            !task ||
+            task.launchCommandId !== action.launchCommandId ||
+            task.workerThreadId !== action.workerThreadId ||
+            !("workerRunId" in task) ||
+            task.workerRunId !== action.workerRunId
+          )
+            return yield* reject("Worker settlement task identity mismatch.");
+          const worker = yield* mapDispatchError(command)(
+            projectionStore.getThreadRecords(
+              action.workerThreadId,
+              ["runs", "attempts", "providerThreads"],
+              { runIds: [action.workerRunId] },
+            ),
+          );
+          const workerRun = worker.runs.find((candidate) => candidate.id === action.workerRunId);
+          const owner = workerRun?.controlledWorkerOwnership;
+          const attempt = worker.attempts.find(
+            (candidate) => candidate.id === action.workerAttemptId,
+          );
+          const providerThread = worker.providerThreads.find(
+            (candidate) => candidate.id === owner?.providerThreadId,
+          );
+          if (
+            !workerRun ||
+            !owner ||
+            controlledWorkerOwnershipProblem(run, worker.thread, workerRun) ||
+            owner.taskId !== action.taskId ||
+            owner.workerAttemptId !== action.workerAttemptId ||
+            worker.thread.projectId !== projection.thread.projectId ||
+            !attempt ||
+            attempt.runId !== workerRun.id ||
+            attempt.attemptOrdinal !== 1 ||
+            attempt.reason !== "initial" ||
+            attempt.rootNodeId !== workerRun.rootNodeId ||
+            attempt.providerInstanceId !== owner.providerInstanceId ||
+            attempt.providerThreadId !== owner.providerThreadId ||
+            !providerThread ||
+            providerThread.providerInstanceId !== owner.providerInstanceId ||
+            providerThread.providerSessionId !== owner.providerSessionId ||
+            providerThread.appThreadId !== worker.thread.id ||
+            (task.submissionCommitment &&
+              (
+                [
+                  "coordinatorThreadId",
+                  "coordinatorRunId",
+                  "taskId",
+                  "workerThreadId",
+                  "workerRunId",
+                  "workerAttemptId",
+                  "providerInstanceId",
+                  "providerThreadId",
+                  "providerSessionId",
+                ] as const
+              ).some((field) => task.submissionCommitment![field] !== owner[field]))
+          )
+            return yield* reject("Worker settlement ownership or attempt is missing or stale.");
+          // Waiting includes checkpoint finalization, not authoritative completion.
+          // A rolled-back run is stale history, not a new worker outcome.
+          if (
+            !["completed", "failed", "interrupted", "cancelled"].includes(workerRun.status) ||
+            workerRun.completedAt === null ||
+            attempt.completedAt === null ||
+            !["completed", "failed", "interrupted", "cancelled"].includes(attempt.status) ||
+            (workerRun.status === "completed" && attempt.status !== "completed")
+          )
+            return yield* reject(
+              "Worker settlement requires a persisted terminal run and attempt.",
+            );
+          const result = transitionMultiAgentTask(
+            state,
+            task.taskId,
+            {
+              type: workerRun.status === "completed" ? "completed" : "worker_failed",
+              result: { workerThreadId: worker.thread.id, workerRunId: workerRun.id },
+            },
+            0,
+          );
+          if (result.status === "rejected")
+            return yield* reject(`Multi-Agent worker settlement rejected: ${result.reason}.`);
+          if (result.status === "unchanged") return;
+          state = result.state;
+          // Display the result in the existing timeline without waking the provider.
+          // This item commits atomically with settlement, so replay cannot redeliver it.
+          const now = yield* DateTime.now;
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(`multi-agent:result:${task.taskId}`),
+              threadId: command.threadId,
+              runId: run.id,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: yield* nextTurnItemOrdinal(projection),
+              type: "notification",
+              status: "completed",
+              title: "Worker result",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              source: {
+                kind: "delegated_task",
+                taskIds: [task.taskId],
+                childThreadId: worker.thread.id,
+              },
+              outcome:
+                workerRun.status === "completed"
+                  ? "completed"
+                  : workerRun.status === "cancelled" || workerRun.status === "interrupted"
+                    ? "cancelled"
+                    : "failed",
+              summary: `${worker.thread.title}: ${workerRun.status}`,
+              detail: `Task: ${task.prompt.slice(0, 500)}\nModel: ${task.modelSelection.model}\nOptions: ${(task.modelSelection.options ?? []).map((option) => `${option.id}=${option.value}`).join(", ")}${task.routingFallback ? "\nRouting fallback: coordinator selection (preferred model unavailable)." : ""}${task.routing?.reason ? `\nRouting: ${task.routing.reason}` : ""}\nResult: Open the worker conversation.\nInitial run: ${workerRun.id}`,
+            },
+          });
+        } else if (action.type === "settle") {
+          const result = settleMultiAgentController(state);
+          if (result.status === "rejected")
+            return yield* reject(`Multi-Agent settlement rejected: ${result.reason}.`);
+          state = result.state;
+        } else if (action.type !== "reserve") {
+          const task = state.tasks.find((candidate) => candidate.taskId === action.taskId);
+          if (!task) return yield* reject("Controller task not found.");
+          if (action.type !== "launch" && action.launchCommandId !== task.launchCommandId)
+            return yield* reject("Worker launch identity mismatch.");
+          if (action.type === "launch_failed") {
+            const receipt = yield* mapDispatchError(command)(
+              commandReceipts.getByCommandId(task.launchCommandId),
+            );
+            if (Option.isSome(receipt))
+              return yield* reject(
+                "A claimed worker launch cannot release capacity without recovery.",
+              );
+          }
+          if (action.type === "started") {
+            if (action.workerThreadId !== task.workerThreadId)
+              return yield* reject("Worker thread identity mismatch.");
+            const worker = yield* mapDispatchError(command)(
+              projectionStore.getThreadRecords(task.workerThreadId, ["runs"], {
+                runIds: [action.workerRunId],
+              }),
+            );
+            const workerRun = worker.runs.find((candidate) => candidate.id === action.workerRunId);
+            if (
+              worker.thread.coordinatorThreadId !== command.threadId ||
+              worker.thread.projectId !== projection.thread.projectId ||
+              workerRun?.userMessageId !== task.launchMessageId ||
+              !modelSelectionsEqual(workerRun.modelSelection, task.modelSelection) ||
+              (workerRun.multiAgent?.mode ?? "off") !== "off"
+            )
+              return yield* reject("Worker run does not belong to this controller task.");
+          }
+          const result = transitionMultiAgentTask(
+            state,
+            task.taskId,
+            action.type === "started"
+              ? { type: "started", workerRunId: action.workerRunId }
+              : { type: action.type },
+            0,
+          );
+          if (result.status === "rejected")
+            return yield* reject(`Multi-Agent launch transition rejected: ${result.reason}.`);
+          state = result.state;
+          if (action.type === "launch" && result.status === "changed") {
+            yield* Ref.update(effects, (pending) => [
+              ...pending,
+              {
+                id: `multi-agent-launch:${task.launchCommandId}`,
+                commandId: command.commandId,
+                threadId: command.threadId,
+                request: {
+                  type: "multi-agent.worker.launch",
+                  coordinatorRunId: run.id,
+                  taskId: task.taskId,
+                  launchCommandId: task.launchCommandId,
+                },
+              } satisfies PendingOrchestrationEffectV2,
+            ]);
+          }
+        } else {
+          const controllers = yield* mapDispatchError(command)(
+            projectionStore.getMultiAgentControllerRuns(),
+          );
+          const occupancy = controllers.reduce(
+            (sum, candidate) =>
+              sum +
+              (candidate.multiAgentController?.tasks.filter(multiAgentTaskOccupiesCapacity)
+                .length ?? 0),
+            0,
+          );
+          const result = transitionMultiAgentTask(
+            state,
+            action.taskId,
+            { type: "reserve" },
+            occupancy,
+          );
+          if (result.status === "rejected")
+            return yield* reject(`Multi-Agent reservation rejected: ${result.reason}.`);
+          state = result.state;
+        }
+      }
+      const expectedRevision = run.multiAgentControllerRevision ?? 0;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "multi-agent.controller.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        occurredAt: yield* DateTime.now,
+        payload: {
+          state,
+          expectedRevision,
+          revision: expectedRevision + (state === run.multiAgentController ? 0 : 1),
+        },
+      });
+      const newlyAdmitted =
+        command.action.type === "admit_proposal" &&
+        state.tasks.length > (run.multiAgentController?.tasks.length ?? 0);
+      const releasedCapacity =
+        (run.multiAgentController?.tasks.filter(multiAgentTaskOccupiesCapacity).length ?? 0) >
+        state.tasks.filter(multiAgentTaskOccupiesCapacity).length;
+      if (newlyAdmitted || releasedCapacity) {
+        const candidates = releasedCapacity
+          ? yield* mapDispatchError(command)(projectionStore.getMultiAgentControllerRuns())
+          : [run];
+        for (const candidate of candidates) {
+          const controller = candidate.id === run.id ? state : candidate.multiAgentController;
+          if (
+            (candidate.multiAgent?.mode !== "custom" && candidate.multiAgent?.mode !== "auto") ||
+            !controller?.coordinatorAttemptId ||
+            controller.status !== "open" ||
+            controller.coordinatorStoppedAt !== undefined ||
+            !controller.tasks.some((task) => task.status === "queued" || task.status === "reserved")
+          )
+            continue;
+          yield* Ref.update(effects, (pending) => [
+            ...pending,
+            {
+              id: `multi-agent-schedule:${command.commandId}:${candidate.id}`,
+              commandId: command.commandId,
+              threadId: candidate.threadId,
+              request: { type: "multi-agent.controller.schedule", coordinatorRunId: candidate.id },
+            } satisfies PendingOrchestrationEffectV2,
+          ]);
+        }
+      }
+    },
+  );
+
   const dispatchUnsupported = (command: OrchestrationV2ServerCommand) =>
     Effect.fail(
       new OrchestratorDispatchError({
@@ -10619,6 +11334,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       | undefined;
     switch (command.type) {
+      case "multi-agent.controller.command":
+        yield* dispatchMultiAgentController(command, events, effects);
+        break;
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
         break;
@@ -10886,6 +11604,81 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       default:
         return yield* dispatchUnsupported(command);
     }
+    // All creation paths (including queued/deferred starts) commit enrollment
+    // with the run, before the outbox can expose it to provider execution.
+    for (const event of yield* Ref.get(events)) {
+      if (
+        event.type !== "run.created" ||
+        (event.payload.multiAgent?.mode !== "custom" && event.payload.multiAgent?.mode !== "auto")
+      )
+        continue;
+      const run = event.payload;
+      const reject = (reason: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Multi-Agent initialization rejected: ${reason}.`,
+        });
+      if (run.controlledWorkerOwnership)
+        return yield* reject("controlled workers cannot enroll as coordinators");
+      if (run.activeAttemptId === null) return yield* reject("initial attempt is missing");
+      if (Option.isNone(providerRegistry)) return yield* reject("provider catalog is unavailable");
+      const providers = yield* providerRegistry.value.getProviders;
+      const context = { providers };
+      const coordinator = validateModelSelection(run.modelSelection, context);
+      if ("issue" in coordinator) return yield* reject(`coordinator ${coordinator.issue.reason}`);
+      const provider = providers.find(
+        (candidate) => candidate.instanceId === run.providerInstanceId,
+      );
+      const adapter = yield* providerAdapters
+        .get(run.providerInstanceId)
+        .pipe(mapDispatchError(command));
+      if (provider?.driver !== "codex" || adapter.driver !== "codex")
+        return yield* reject("only Codex coordinators are supported");
+      const autoRoutingCatalog =
+        run.multiAgent?.mode === "auto"
+          ? createMultiAgentAutoCatalog(run.modelSelection, providers)
+          : undefined;
+      if (run.multiAgent?.mode === "auto" && !autoRoutingCatalog)
+        return yield* reject("no supported Auto worker models are available");
+      for (const role of ["planner", "worker", "rescuer", "reviewer"] as const) {
+        if (run.multiAgent?.mode === "auto") break;
+        if (role !== "worker" && run.multiAgent?.mode === "custom" && !run.multiAgent.roles[role])
+          continue;
+        const routing = resolveMultiAgentRouting(run.multiAgent, role, context);
+        if (routing.status !== "resolved")
+          return yield* reject(
+            `${role} ${routing.status === "unavailable" ? routing.issue.reason : routing.status}`,
+          );
+        if (
+          providers.find((candidate) => candidate.instanceId === routing.modelSelection.instanceId)
+            ?.driver !== "codex"
+        )
+          return yield* reject(`${role} requires a Codex provider`);
+      }
+      if (run.multiAgentReview || run.multiAgentController !== undefined) continue;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "multi-agent.controller.updated",
+        threadId: run.threadId,
+        runId: run.id,
+        occurredAt: event.occurredAt,
+        payload: {
+          expectedRevision: 0,
+          revision: 1,
+          state: {
+            ...(autoRoutingCatalog ? { autoRoutingCatalog } : {}),
+            coordinatorThreadId: run.threadId,
+            coordinatorRunId: run.id,
+            coordinatorAttemptId: run.activeAttemptId,
+            status: "open",
+            tasks: [],
+          },
+        },
+      });
+    }
     return {
       events: yield* Ref.get(events),
       effects: yield* Ref.get(effects),
@@ -10946,12 +11739,77 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      if (
+        command.type === "multi-agent.controller.command" &&
+        (receipt.commandType !== command.type ||
+          !storedEvents.some(
+            (stored) =>
+              stored.event.type === "multi-agent.controller.updated" &&
+              stored.event.runId === command.runId,
+          ))
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Controller command receipt belongs to a different run or operation.",
+        });
+      }
+      if (
+        command.type === "multi-agent.controller.command" &&
+        command.action.type === "admit_proposal"
+      ) {
+        const source = yield* mapDispatchError(command)(
+          projectionStore.getTurnItem({
+            threadId: command.threadId,
+            itemId: command.action.proposalItemId,
+          }),
+        );
+        const attemptId = command.action.attemptId;
+        const sourceIdentity = [
+          command.threadId,
+          command.runId,
+          attemptId,
+          command.action.proposalItemId,
+        ]
+          .map(encodeURIComponent)
+          .join(":");
+        if (
+          source?.type !== "assistant_message" ||
+          !storedEvents.some(
+            (stored) =>
+              stored.event.type === "multi-agent.controller.updated" &&
+              (source.runId === command.runId ||
+                stored.event.payload.state.reviews?.some(
+                  (review) => review.runId === source.runId && review.attemptId === attemptId,
+                )),
+          ) ||
+          !storedEvents.some(
+            (stored) =>
+              stored.event.type === "multi-agent.controller.updated" &&
+              stored.event.payload.state.tasks.some(
+                (task) =>
+                  task.proposalId === source.messageId &&
+                  task.proposalAttemptId === attemptId &&
+                  task.taskId === `multi-agent:task:${sourceIdentity}:0`,
+              ),
+          )
+        )
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Proposal receipt belongs to a different execution source.",
+          });
+      }
       if (command.type === "queue.resume") {
         yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
       }
       return {
         sequence: receipt.resultSequence,
         storedEvents,
+        ...(command.type === "multi-agent.controller.command" &&
+        command.action.type === "commit_submission"
+          ? { submissionCommitmentGranted: false }
+          : {}),
       } satisfies OrchestratorV2DispatchResult;
     }
 
@@ -10976,7 +11834,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         planned.events.length > 0 ||
         command.type === "thread.background-work.settle" ||
         command.type === "thread.stop" ||
-        command.type === "subagent.stop"
+        command.type === "run.interrupt" ||
+        command.type === "subagent.stop" ||
+        (command.type === "multi-agent.controller.command" &&
+          (command.action.type === "worker_finished" || command.action.type === "review_results"))
           ? Effect.succeed(planned)
           : Effect.fail(
               new OrchestratorDispatchError({
@@ -11097,6 +11958,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return {
       sequence: committed.receipt.resultSequence,
       storedEvents: committed.storedEvents,
+      ...(command.type === "multi-agent.controller.command" &&
+      command.action.type === "commit_submission"
+        ? { submissionCommitmentGranted: committed.committed }
+        : {}),
     } satisfies OrchestratorV2DispatchResult;
   });
 
@@ -11121,6 +11986,86 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? dispatch
         : threadDispatch.withLock(parentThreadId, dispatch);
     });
+
+  const settleControlledWorker = (threadId: ThreadId, runId: RunId) =>
+    Effect.gen(function* () {
+      const worker = yield* projectionStore.getThreadRecords(threadId, ["runs", "attempts"], {
+        runIds: [runId],
+      });
+      const run = worker.runs.find((candidate) => candidate.id === runId);
+      const owner = run?.controlledWorkerOwnership;
+      if (
+        !run ||
+        !owner ||
+        owner.workerThreadId !== threadId ||
+        owner.workerRunId !== runId ||
+        !["completed", "failed", "interrupted", "cancelled"].includes(run.status) ||
+        run.completedAt === null
+      )
+        return;
+      const attempt = worker.attempts.find((candidate) => candidate.id === owner.workerAttemptId);
+      if (
+        !attempt ||
+        attempt.runId !== runId ||
+        run.activeAttemptId !== owner.workerAttemptId ||
+        attempt.completedAt === null ||
+        (run.status === "completed" && attempt.status !== "completed") ||
+        !["completed", "failed", "interrupted", "cancelled"].includes(attempt.status)
+      )
+        return;
+      const coordinator = yield* projectionStore.getThreadRecords(
+        owner.coordinatorThreadId,
+        ["runs"],
+        { runIds: [owner.coordinatorRunId] },
+      );
+      const task = coordinator.runs
+        .find((candidate) => candidate.id === owner.coordinatorRunId)
+        ?.multiAgentController?.tasks.find((candidate) => candidate.taskId === owner.taskId);
+      // A terminal event can beat the launch receipt. Do not permanently reject
+      // the stable completion command before started has registered the exact run.
+      if (
+        !task ||
+        !("workerRunId" in task) ||
+        task.workerRunId !== runId ||
+        task.workerThreadId !== threadId ||
+        task.launchCommandId !== owner.launchCommandId
+      )
+        return;
+      yield* dispatchWithReceipt(controlledWorkerFinishedCommand(owner));
+    });
+
+  const reconcileMultiAgentReviews = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const projection = yield* projectionStore.getThreadRecords(threadId, ["runs"]);
+      for (const run of projection.runs) {
+        if (multiAgentReviewDecision(run, projection.runs) === "none") continue;
+        const count = run.multiAgentController!.reviews?.length ?? 0;
+        yield* dispatchWithReceipt({
+          type: "multi-agent.controller.command",
+          threadId,
+          runId: run.id,
+          commandId: CommandId.make(
+            `multi-agent:review-decision:${run.id}:${run.multiAgentController!.tasks.length}:${count}`,
+          ),
+          action: { type: "review_results" },
+        });
+      }
+    });
+  yield* eventSink
+    .stream({
+      afterSequence: yield* eventSink.latestSequence().pipe(Effect.orDie),
+      eventType: "multi-agent.controller.updated",
+    })
+    .pipe(
+      Stream.runForEach((stored) =>
+        reconcileMultiAgentReviews(stored.event.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Multi-Agent review reconciliation failed", { cause }),
+          ),
+        ),
+      ),
+      Effect.forkDetach,
+    );
 
   const handleTerminalRun = (stored: OrchestrationV2StoredEvent) =>
     Effect.gen(function* () {
@@ -11163,6 +12108,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (parentThreadId !== undefined) {
         yield* threadDispatch.withLock(parentThreadId, finalizeAppOwnedSubagent(threadId));
       }
+      // All worker locks above have been released. Dispatch acquires the coordinator lock.
+      if (stored.event.type === "run.updated")
+        yield* settleControlledWorker(threadId, stored.event.payload.id);
+      yield* reconcileMultiAgentReviews(threadId);
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("Failed to react to terminal V2 run", {
@@ -11202,6 +12151,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   // worker. Queue recovery instead holds unstarted runs until an explicit
   // queue.resume command arrives.
   const recoverDelegatedTasks = Effect.gen(function* () {
+    const controllers = yield* projectionStore
+      .getMultiAgentControllerRuns()
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to inspect controlled workers during recovery", { cause }).pipe(
+            Effect.as([]),
+          ),
+        ),
+      );
+    for (const coordinator of controllers)
+      for (const task of coordinator.multiAgentController?.tasks ?? [])
+        if (
+          "workerRunId" in task &&
+          task.workerRunId !== undefined &&
+          (task.status === "running" || task.status === "cancellation_pending")
+        )
+          yield* settleControlledWorker(task.workerThreadId, task.workerRunId).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Failed to recover controlled worker settlement", {
+                coordinatorRunId: coordinator.id,
+                taskId: task.taskId,
+                cause,
+              }),
+            ),
+          );
+    for (const coordinator of controllers)
+      yield* reconcileMultiAgentReviews(coordinator.threadId).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to recover coordinator review", { cause }),
+        ),
+      );
     yield* projectionStore.getRecoveryThreadIds("subagent-results").pipe(
       Effect.flatMap((threadIds) =>
         Effect.forEach(
@@ -11334,12 +12314,161 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const shellProjectionError = (cause: unknown) =>
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
+  const scheduleMultiAgentWorkers: OrchestratorV2Shape["scheduleMultiAgentWorkers"] = Effect.fn(
+    "orchestrationV2.scheduleMultiAgentWorkers",
+  )(function* (input) {
+    if (controlledWorkerExecutionDisabled || Option.isNone(providerRegistry)) return;
+    const load = () =>
+      projectionStore
+        .getThreadRecords(input.threadId, ["runs", "attempts"], { runIds: [input.runId] })
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+          ),
+        );
+    const eligible = (run: OrchestrationV2Run | undefined) =>
+      (run?.multiAgent?.mode === "custom" || run?.multiAgent?.mode === "auto") &&
+      run.multiAgentController?.coordinatorThreadId === input.threadId &&
+      run.multiAgentController.coordinatorRunId === input.runId &&
+      run.multiAgentController.coordinatorAttemptId !== undefined &&
+      run.multiAgentController.status === "open" &&
+      run.multiAgentController.coordinatorStoppedAt === undefined;
+    const occupancy = () =>
+      projectionStore.getMultiAgentControllerRuns().pipe(
+        Effect.map((runs) =>
+          runs.reduce(
+            (sum, run) =>
+              sum +
+              (run.multiAgentController?.tasks.filter(multiAgentTaskOccupiesCapacity).length ?? 0),
+            0,
+          ),
+        ),
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+        ),
+      );
+    const initial = yield* load();
+    const run = initial.runs[0];
+    if (!eligible(run) || initial.thread.archivedAt !== null || initial.thread.deletedAt !== null)
+      return;
+    const catalog = yield* providerRegistry.value.getProviders;
+    if (
+      !multiAgentCodexEligibility(run!, catalog).eligible ||
+      !initial.attempts.some(
+        (attempt) =>
+          attempt.id === run!.multiAgentController!.coordinatorAttemptId &&
+          attempt.attemptOrdinal === 1 &&
+          attempt.runId === run!.id &&
+          attempt.providerInstanceId === run!.providerInstanceId,
+      )
+    )
+      return;
+    const adapter = yield* providerAdapters.get(run!.providerInstanceId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: input.schedulingId,
+            commandType: "multi-agent.controller.command",
+            cause,
+          }),
+      ),
+    );
+    if (adapter.driver !== "codex") return;
+    // Finish already-reserved work first, including a crash between reserve and launch.
+    const candidates = run!
+      .multiAgentController!.tasks.filter(
+        (task) => task.status === "queued" || task.status === "reserved",
+      )
+      .toSorted((a, b) => Number(b.status === "reserved") - Number(a.status === "reserved"));
+    for (const candidate of candidates) {
+      const current = yield* load();
+      const currentRun = current.runs[0];
+      if (
+        !eligible(currentRun) ||
+        current.thread.archivedAt !== null ||
+        current.thread.deletedAt !== null
+      )
+        return;
+      const controller = currentRun!.multiAgentController!;
+      const task = controller.tasks.find((task) => task.taskId === candidate.taskId);
+      if (!task || (task.status !== "queued" && task.status !== "reserved")) continue;
+      const freshCatalog = yield* providerRegistry.value.getProviders;
+      if (!multiAgentCodexEligibility(currentRun!, freshCatalog).eligible) return;
+      const selected = resolvePersistedMultiAgentTask(currentRun!, task, {
+        providers: freshCatalog,
+      });
+      if (
+        selected.status !== "resolved" ||
+        !modelSelectionsEqual(selected.modelSelection, task.modelSelection) ||
+        /^\/goal(?:\s|$)/iu.test(task.prompt.trim())
+      )
+        continue;
+      const workerAdapter = yield* providerAdapters.get(task.modelSelection.instanceId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: input.schedulingId,
+              commandType: "multi-agent.controller.command",
+              cause,
+            }),
+        ),
+      );
+      if (workerAdapter.driver !== "codex") continue;
+      if (task.status === "queued") {
+        if (
+          controller.tasks.filter(multiAgentTaskOccupiesCapacity).length >=
+            MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerController ||
+          (yield* occupancy()) >= MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerEnvironment
+        )
+          return;
+        const reserved = yield* dispatchWithReceipt({
+          type: "multi-agent.controller.command",
+          commandId: CommandId.make(`${input.schedulingId}:reserve:${task.taskId}`),
+          threadId: input.threadId,
+          runId: input.runId,
+          action: { type: "reserve", taskId: task.taskId },
+        }).pipe(
+          Effect.as(true),
+          Effect.catch((cause) =>
+            Effect.gen(function* () {
+              const fresh = (yield* load()).runs[0];
+              if (
+                !eligible(fresh) ||
+                (yield* occupancy()) >= MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerEnvironment ||
+                (fresh?.multiAgentController?.tasks.filter(multiAgentTaskOccupiesCapacity).length ??
+                  0) >= MULTI_AGENT_CONTROLLER_LIMITS.concurrentPerController
+              )
+                return false;
+              return yield* cause;
+            }),
+          ),
+        );
+        if (!reserved) return;
+      }
+      yield* dispatchWithReceipt({
+        type: "multi-agent.controller.command",
+        commandId: CommandId.make(`${task.launchCommandId}:scheduled-launch`),
+        threadId: input.threadId,
+        runId: input.runId,
+        action: { type: "launch", taskId: task.taskId },
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.gen(function* () {
+            if (!eligible((yield* load()).runs[0])) return;
+            return yield* cause;
+          }),
+        ),
+      );
+    }
+  });
+
   return OrchestratorV2.of({
     resumeQueuedRuns,
     recoverDelegatedTasks,
     recoverDelegatedTask,
     delegatedTaskResultPending,
     dispatch: dispatchWithReceipt,
+    scheduleMultiAgentWorkers,
     searchThreadStream: (input) =>
       projectionStore
         .searchThreadStream(input)
@@ -11487,6 +12616,14 @@ const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
     recoverDelegatedTasks: Effect.void,
     recoverDelegatedTask: () => Effect.void,
     delegatedTaskResultPending: () => Effect.succeed(false),
+    scheduleMultiAgentWorkers: () =>
+      Effect.fail(
+        new OrchestratorDispatchError({
+          commandId: CommandId.make("multi-agent:schedule:unavailable"),
+          commandType: "multi-agent.controller.command",
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
     dispatch: (command) =>
       Effect.fail(
         new OrchestratorDispatchError({

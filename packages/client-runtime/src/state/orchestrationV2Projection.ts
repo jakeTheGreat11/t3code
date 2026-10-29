@@ -227,9 +227,43 @@ export function applyOrchestrationV2ProjectionEvent(
       return { ...projection, thread: event.payload };
     case "run.created":
     case "run.updated": {
-      const next = { ...base, runs: upsertEntity(base.runs, event.payload) };
+      const current = base.runs.find((run) => run.id === event.payload.id);
+      const payload = {
+        ...event.payload,
+        ...(current === undefined
+          ? {}
+          : { multiAgent: current.multiAgent ?? { mode: "off" as const } }),
+        ...(current?.multiAgentReview === undefined
+          ? {}
+          : { multiAgentReview: current.multiAgentReview }),
+        ...(current?.newRunTrigger === undefined ? {} : { newRunTrigger: current.newRunTrigger }),
+        ...(current?.controlledWorkerOwnership === undefined
+          ? {}
+          : { controlledWorkerOwnership: current.controlledWorkerOwnership }),
+        ...(current?.multiAgentController === undefined
+          ? {}
+          : {
+              multiAgentController: current.multiAgentController,
+              multiAgentControllerRevision: current.multiAgentControllerRevision ?? 0,
+            }),
+      };
+      const next = { ...base, runs: upsertEntity(base.runs, payload) };
       return { ...next, visibleTurnItems: activeVisibleTurnItems(next) };
     }
+    case "multi-agent.controller.updated":
+      return {
+        ...base,
+        runs: base.runs.map((run) =>
+          run.id !== event.runId ||
+          (run.multiAgentControllerRevision ?? 0) >= event.payload.revision
+            ? run
+            : {
+                ...run,
+                multiAgentController: event.payload.state,
+                multiAgentControllerRevision: event.payload.revision,
+              },
+        ),
+      };
     case "run.background-work-cancelled":
       return {
         ...base,

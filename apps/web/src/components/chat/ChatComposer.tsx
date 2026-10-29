@@ -1377,6 +1377,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   } | null;
   isRunning: boolean;
   canInterrupt: boolean;
+  interruptLabel?: string | undefined;
   followUpBehavior: "queue" | "steer";
   alternateShortcutLabel: string | null;
   showPlanFollowUpPrompt: boolean;
@@ -1420,6 +1421,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         pendingAction={props.pendingAction}
         isRunning={props.isRunning}
         canInterrupt={props.canInterrupt}
+        interruptLabel={props.interruptLabel}
         followUpBehavior={props.followUpBehavior}
         alternateShortcutLabel={props.alternateShortcutLabel}
         showPlanFollowUpPrompt={props.showPlanFollowUpPrompt}
@@ -1553,8 +1555,9 @@ export interface ChatComposerProps {
 
   // Session phase
   phase: SessionPhase;
-  /** Stop is offered: a run is preparing, starting, or running. */
+  /** Stop is offered for active execution or an open Multi-Agent coordinator. */
   canInterrupt: boolean;
+  interruptLabel?: string | undefined;
   isConnecting: boolean;
   isSendBusy: boolean;
   canResume: boolean;
@@ -1741,6 +1744,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     projectSelectionRequired,
     phase,
     canInterrupt,
+    interruptLabel,
     isConnecting,
     isSendBusy,
     canResume,
@@ -7720,6 +7724,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     pendingAction={pendingPrimaryAction}
                     isRunning={phase === "running"}
                     canInterrupt={canInterrupt}
+                    interruptLabel={interruptLabel}
                     followUpBehavior={settings.followUpBehavior}
                     alternateShortcutLabel={shortcutLabelForCommand(
                       keybindings,

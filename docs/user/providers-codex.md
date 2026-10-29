@@ -2,6 +2,44 @@
 
 Use your ChatGPT plan or an existing Codex CLI login to code in T3 Code.
 
+## Delegate with Multi-Agent mode
+
+On web or desktop, choose a Codex coordinator model and reasoning setting in the
+composer. Open **Multi-Agent** and choose **Auto** to let the coordinator select
+each worker's model and reasoning settings from that Codex account's available
+models. **Budget** favors economy, **Balanced** balances capability and expense,
+and **Maximum** favors quality for demanding tasks. These guide the coordinator's
+judgment; they are not measured price or performance rankings.
+
+Choose **Custom** instead to assign a Codex model and reasoning options to
+**Worker** yourself. Other roles are optional; any assigned roles must also use
+Codex. Other providers are not supported for automatic delegation yet.
+
+Send your goal normally. The coordinator decides whether independent workers will
+help; you do not need to choose a worker count or divide the work. Up to two workers
+can run concurrently, with four tasks total for one coordinator. Workers share the
+project workspace, so review their changes together before committing.
+
+Workers appear beneath the coordinator in the sidebar. The delegation summary
+shows worker progress, selected models, and links to results. Once the outstanding
+batch settles, the coordinator automatically reviews the results and performs
+integration and verification. **Stop Coordinator** disables new delegation and
+automatic review; already-committed workers can finish and their results remain
+available.
+
+Auto records each task's model and options before launching it. The worker
+conversation and its result notification show that selection. If a model offered
+to the coordinator disappears before the task is admitted, T3 can use the
+coordinator's saved selection when it is still available. Invalid options are
+rejected. Once a task is admitted, T3 keeps its selection across restarts and
+will not submit it if that selection becomes unavailable. Such a task can remain
+queued until the selection is available again; T3 does not silently switch models.
+
+**Stop coordinator** prevents new delegation. Workers already authorized to submit
+their assignments may finish, and their conversations and results remain available.
+Stop an individual worker separately if needed. Later manual turns in a worker
+conversation are independent of its original assignment.
+
 ## Connect with ChatGPT
 
 Connect during onboarding or in **Settings → Providers**. For a remote machine,

@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
 
 import * as ServerSettings from "../serverSettings.ts";
+import { controlledCodexOriginBlocked } from "./ControlledCodexContinuation.ts";
 import { isNativeMaintenanceCommand } from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import {
@@ -110,6 +111,7 @@ export function restartContinuationRun(
   const preparedContinuation =
     run.status === "starting" && run.restartContinuationOfRunId !== undefined;
   if (run.status !== "running" && !preparedContinuation) return;
+  if (controlledCodexOriginBlocked(projection, run.id)) return;
   if (restartContinuationBlocked(projection, run, now)) return;
   const liveTurnRequired = !preparedContinuation;
   if (projection.thread.providerInstanceId !== run.providerInstanceId) return;
@@ -163,7 +165,15 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     const messageId = MessageId.make(`message:restart-continuation:${input.sourceRunId}`);
     const projection = yield* threads.getThreadRecords(
       input.threadId,
-      ["messages", "runs", "providerTurns", "attempts", "runtimeRequests", "turnItems"],
+      [
+        "messages",
+        "runs",
+        "providerThreads",
+        "providerTurns",
+        "attempts",
+        "runtimeRequests",
+        "turnItems",
+      ],
       { messageIds: [messageId], turnItemTypes: ["secret_request"] },
     );
     if (
@@ -177,6 +187,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     // including waiting runs that reconciliation subsequently cancelled.
     if (
       !source ||
+      controlledCodexOriginBlocked(projection, source.id) ||
       source.status !== "cancelled" ||
       isRestartNoteSource(source, projection.providerTurns) ||
       restartContinuationBlocked(projection, source, yield* DateTime.now)

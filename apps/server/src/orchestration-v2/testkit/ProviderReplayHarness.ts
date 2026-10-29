@@ -1,7 +1,12 @@
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { ProviderDriverKind, ProviderReplayTranscript } from "@t3tools/contracts";
+import type {
+  ProviderDriverKind,
+  ProviderReplayTranscript,
+  ServerProvider,
+} from "@t3tools/contracts";
+import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -28,6 +33,8 @@ import * as CommandReceiptStore from "../CommandReceiptStore.ts";
 import * as ContextHandoffService from "../ContextHandoffService.ts";
 import * as EffectOutbox from "../EffectOutbox.ts";
 import * as EffectWorker from "../EffectWorker.ts";
+import * as MultiAgentWorkerLaunchService from "../MultiAgentWorkerLaunchService.ts";
+import { ControlledWorkerExecutionDisabled } from "../ControlledWorkerSubmission.ts";
 import * as EventSink from "../EventSink.ts";
 import * as EventStore from "../EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -275,6 +282,13 @@ export function layerWithRegistry<Error>(
     // as server startup does after a crash or restart.
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
+    /** Integrations can forward to the real launch service assembled around this runtime. */
+    readonly controlledWorkerLaunch?: MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService["Service"]["execute"];
+    readonly stopDelegatedTasks?: ThreadManagementService.ThreadManagementService["Service"]["stopDelegatedTasks"];
+    readonly checkpointStoreLayer?: Layer.Layer<CheckpointStore.CheckpointStore>;
+    readonly providerCatalog?: readonly ServerProvider[];
+    /** Only set when the registry supplies scripted, non-network runtimes. */
+    readonly controlledWorkerExecutionDisabled?: boolean;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
@@ -336,10 +350,12 @@ export function layerWithRegistry<Error>(
     Layer.provide(layerServerConfig),
     Layer.provide(NodeServices.layer),
   );
-  const layerCheckpointStore = CheckpointStore.layer.pipe(
-    Layer.provide(layerVcsDriverRegistry),
-    Layer.provide(NodeServices.layer),
-  );
+  const layerCheckpointStore =
+    options.checkpointStoreLayer ??
+    CheckpointStore.layer.pipe(
+      Layer.provide(layerVcsDriverRegistry),
+      Layer.provide(NodeServices.layer),
+    );
   const layerCheckpointServiceProvided = CheckpointService.layer.pipe(
     Layer.provide(Layer.mergeAll(layerCheckpointStore, IdAllocator.layer)),
   );
@@ -383,22 +399,6 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
-  const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        layerContextHandoffServiceProvided,
-        layerEventSinkProvided,
-        IdAllocator.layer,
-        layerStores,
-        layerProviderSessionManagerProvided,
-        Layer.mock(ProviderAuthService.ProviderAuthService)({
-          tryHandlePromptCommand: () => Effect.succeed(false),
-        }),
-        layerRunExecutionServiceProvided,
-        layerRuntime,
-      ),
-    ),
-  );
   const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
     Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
   );
@@ -439,6 +439,12 @@ export function layerWithRegistry<Error>(
   );
   const layerOrchestratorProvided = Orchestrator.layer.pipe(
     Layer.provide(
+      Layer.succeed(
+        ControlledWorkerExecutionDisabled,
+        options.controlledWorkerExecutionDisabled ?? false,
+      ),
+    ),
+    Layer.provide(
       Layer.mergeAll(
         layerCheckpointServiceProvided,
         CommandPolicy.layer,
@@ -447,6 +453,7 @@ export function layerWithRegistry<Error>(
         layerProvidedRegistry,
         layerContinuationRequests,
         layerRuntime,
+        ProviderRegistryMock.layer(options.providerCatalog),
         layerProviderSessionManagerProvided,
         layerProviderSwitchServiceProvided,
         layerRunExecutionServiceProvided,
@@ -455,15 +462,44 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
+  const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+    Layer.provide(
+      Layer.succeed(
+        ControlledWorkerExecutionDisabled,
+        options.controlledWorkerExecutionDisabled ?? false,
+      ),
+    ),
+    Layer.provide(
+      Layer.mergeAll(
+        ThreadCommandExecutor.layer,
+        layerOrchestratorProvided,
+        layerContextHandoffServiceProvided,
+        layerEventSinkProvided,
+        IdAllocator.layer,
+        layerStores,
+        layerProviderSessionManagerProvided,
+        Layer.mock(ProviderAuthService.ProviderAuthService)({
+          tryHandlePromptCommand: () => Effect.succeed(false),
+        }),
+        layerRunExecutionServiceProvided,
+        ProviderRegistryMock.layer(options.providerCatalog),
+        layerRuntime,
+      ),
+    ),
+  );
   const layerThreadManagementProvided = Layer.unwrap(
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       return Layer.mock(ThreadManagementService.ThreadManagementService)({
         dispatch: orchestrator.dispatch,
+        scheduleMultiAgentWorkers: orchestrator.scheduleMultiAgentWorkers,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,
         recoverDelegatedTask: orchestrator.recoverDelegatedTask,
         delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
+        ...(options.stopDelegatedTasks === undefined
+          ? {}
+          : { stopDelegatedTasks: options.stopDelegatedTasks }),
       });
     }),
   ).pipe(Layer.provide(layerOrchestratorProvided));
@@ -482,6 +518,14 @@ export function layerWithRegistry<Error>(
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.provide(
       Layer.mergeAll(
+        options.controlledWorkerLaunch === undefined
+          ? Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)({})
+          : Layer.succeed(
+              MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService,
+              MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService.of({
+                execute: options.controlledWorkerLaunch,
+              }),
+            ),
         layerRunFinalizationServiceProvided,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,

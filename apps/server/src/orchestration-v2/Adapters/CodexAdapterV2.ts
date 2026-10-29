@@ -1691,6 +1691,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
     threadId === null ? Effect.succeed(undefined) : mcpSessions.read(threadId);
   const { clientFactory, crypto, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
+  const continuationEmitter = yield* ProviderContinuationRequests.makeContinuationEmitter(
+    adapterOptions.instanceId,
+    continuationRequests,
+  );
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
@@ -1700,6 +1704,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
     openSession: (input) =>
       Effect.gen(function* () {
         const scope = yield* Scope.Scope;
+        const sessionEmitter = yield* continuationEmitter.forSession(input.providerSessionId);
         const resolvedRuntime =
           adapterOptions.resolveRuntime === undefined
             ? undefined
@@ -4811,7 +4816,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     },
                   );
                   if (!alreadyOffered) {
-                    yield* continuationRequests.offer({
+                    yield* sessionEmitter.offer({
                       threadId: context.projectionThreadId,
                       providerThreadId: context.providerThread.id,
                       driver: CODEX_PROVIDER,
@@ -6410,6 +6415,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         };
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          continuationEmitterIdentity: sessionEmitter.identity,
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
           providerSessionId: input.providerSessionId,

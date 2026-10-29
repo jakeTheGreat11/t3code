@@ -215,7 +215,7 @@ describe("Multi-Agent composer preferences UI", () => {
         await act(() => container.querySelector<HTMLButtonElement>("button")!.click());
       }
       expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
-        "Multi-Agent execution is not enabled",
+        "Auto and Custom support Codex coordinators with Codex workers",
       );
       await choose("Multi-Agent mode", "Auto");
       await choose("Multi-Agent auto preset", "Maximum");

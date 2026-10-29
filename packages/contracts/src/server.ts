@@ -81,6 +81,8 @@ export type ServerProviderAuth = typeof ServerProviderAuth.Type;
 export const ServerProviderModel = Schema.Struct({
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
+  /** Provider-supplied guidance; not a measured ranking or verified price. */
+  description: Schema.optional(TrimmedNonEmptyString),
   shortName: Schema.optional(TrimmedNonEmptyString),
   subProvider: Schema.optional(TrimmedNonEmptyString),
   aliases: Schema.optional(Schema.Array(TrimmedNonEmptyString)),

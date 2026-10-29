@@ -6611,6 +6611,16 @@ describe("AcpAdapterV2", () => {
       assert.equal(eagerCompletedUpdates, 1, "completed root must project before any attach");
       assert.equal(eagerRunningUpdates, 0);
       assert.lengthOf(continuationRequests, 1);
+      assert.deepEqual(
+        continuationRequests[0]!.emitterIdentity,
+        runtime.continuationEmitterIdentity,
+      );
+      assert.equal(continuationRequests[0]!.emitterIdentity?.type, "known");
+      assert.deepInclude(continuationRequests[0]?.emitterIdentity, {
+        type: "known",
+        providerInstanceId: runtime.instanceId,
+        providerSessionId: runtime.providerSessionId,
+      });
       assert.isTrue(yield* hasPendingBackgroundWork, "buffered spawn ACK still requires a drain");
 
       const continuationNow = yield* DateTime.now;

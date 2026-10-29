@@ -1,4 +1,5 @@
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
+import { controlledCodexDispatchBlocked } from "./ControlledCodexContinuation.ts";
 import {
   MessageId,
   type NodeId,
@@ -238,6 +239,24 @@ export const layer: Layer.Layer<
       interruptAndAwaitTerminal: (input) =>
         Effect.gen(function* () {
           const loaded = yield* load({ ...input, operation: "restart" });
+          if (loaded.providerThread.driver === "codex") {
+            const projection = yield* projections.getThreadRecords(input.threadId, ["runs"]);
+            if (
+              projection.runs.some(
+                (run) =>
+                  run.controlledWorkerOwnership &&
+                  run.controlledWorkerOwnership.workerAttemptId ===
+                    loaded.providerTurn.runAttemptId &&
+                  run.controlledWorkerOwnership.providerThreadId === loaded.providerThread.id,
+              )
+            )
+              return yield* new ProviderTurnControlError({
+                threadId: input.threadId,
+                operation: "restart",
+                providerTurnId: input.providerTurnId,
+                cause: "A controlled Codex initial run cannot be restarted.",
+              });
+          }
           if (Option.isNone(loaded.session)) {
             // No live adapter: nothing can emit a terminal provider-turn update
             // from interrupt. Do not poll for projection terminalization or the
@@ -304,6 +323,22 @@ export const layer: Layer.Layer<
       steer: (input) =>
         Effect.gen(function* () {
           const context = yield* projections.getProviderControlContext(input.threadId, input);
+          const persistedMessage = context.message;
+          if (
+            persistedMessage &&
+            (persistedMessage.notification ||
+              persistedMessage.delegatedCompletion ||
+              persistedMessage.scheduledTaskId ||
+              (persistedMessage.createdBy === "agent" &&
+                (persistedMessage.creationSource === "server" ||
+                  persistedMessage.creationSource === "provider")))
+          ) {
+            const projection = yield* projections.getThreadRecords(input.threadId, [
+              "runs",
+              "providerThreads",
+            ]);
+            if (controlledCodexDispatchBlocked(projection, persistedMessage)) return;
+          }
           const ownership = context.message?.delegatedCompletion;
           if (ownership !== undefined) {
             const projection = yield* projections.getThreadRecords(input.threadId, ["runs"], {

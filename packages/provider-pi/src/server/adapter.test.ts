@@ -732,7 +732,14 @@ describe("PiAdapterV2", () => {
         runtimePolicy,
       });
       yield* fake.emit({ type: "agent_start" });
-      yield* Queue.take(offers);
+      const offered = yield* Queue.take(offers);
+      assert.deepEqual(offered.emitterIdentity, runtime.continuationEmitterIdentity);
+      assert.equal(offered.emitterIdentity?.type, "known");
+      assert.deepInclude(offered?.emitterIdentity, {
+        type: "known",
+        providerInstanceId: runtime.instanceId,
+        providerSessionId: runtime.providerSessionId,
+      });
       yield* fake.emit({ type: "message_start", message: { role: "assistant" } });
       yield* fake.emit({
         type: "message_update",

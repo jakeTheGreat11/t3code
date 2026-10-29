@@ -79,7 +79,7 @@ import {
   backgroundWorkNotification,
   type BackgroundWorkReport,
 } from "@t3tools/provider-core/server/notification";
-import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
   makeSubagentChildThread,
@@ -276,6 +276,10 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const agentScope = yield* AgentScope;
+  const continuationEmitter = yield* ProviderContinuationRequests.makeContinuationEmitter(
+    options.instanceId,
+    options.continuationRequests,
+  );
 
   const protocolError = (detail: string, payload?: unknown) =>
     new ProviderAdapter.ProviderAdapterProtocolError({
@@ -295,6 +299,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       if (input.runtimePolicy.interactionMode === "plan")
         return yield* protocolError("Muse Code does not support dedicated Plan mode");
       const scope = yield* Effect.scope;
+      const sessionEmitter = yield* continuationEmitter.forSession(input.providerSessionId);
       // Muse rejects non-canonical workspace roots (for example macOS /tmp) and
       // reports canonical paths in approvals, so resolve symlinks once here.
       const requestedCwd = input.runtimePolicy.cwd ?? providerHost.paths.cwd;
@@ -1344,7 +1349,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             wake = held;
             const notification = backgroundWorkNotification(finishedBackground.splice(0));
             if (thread?.appThreadId && options.continuationRequests)
-              yield* options.continuationRequests.offer({
+              yield* sessionEmitter.offer({
                 threadId: thread.appThreadId,
                 providerThreadId: thread.id,
                 driver: MUSE_PROVIDER,
@@ -2102,6 +2107,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         };
       });
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+        continuationEmitterIdentity: sessionEmitter.identity,
         instanceId: options.instanceId,
         driver: MUSE_PROVIDER,
         providerSessionId: input.providerSessionId,

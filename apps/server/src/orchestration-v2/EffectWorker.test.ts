@@ -23,6 +23,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as MultiAgentWorkerLaunchService from "./MultiAgentWorkerLaunchService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -83,9 +84,13 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly multiAgentLaunch?: MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService["Service"]["execute"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(MultiAgentWorkerLaunchService.MultiAgentWorkerLaunchService)(
+      input.multiAgentLaunch === undefined ? {} : { execute: input.multiAgentLaunch },
+    ),
     Layer.succeed(
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
@@ -102,6 +107,8 @@ function layerExecutorFor(input: {
     Layer.succeed(
       ProviderSessionManager.ProviderSessionManagerV2,
       ProviderSessionManager.ProviderSessionManagerV2.of({
+        validateContinuationEmitter: () => Effect.die("unused validateContinuationEmitter"),
+        markControlledWorkerExposure: () => Effect.die("unused markControlledWorkerExposure"),
         shutdown: Effect.void,
         open: () => Effect.die("unused open"),
         get: () => Effect.succeed(Option.none()),
@@ -160,6 +167,36 @@ function layerExecutorFor(input: {
     ),
   );
 }
+
+it.effect("dispatches a controller launch effect with its persisted run and task identity", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const now = yield* DateTime.now;
+    const request = {
+      type: "multi-agent.worker.launch" as const,
+      coordinatorRunId: runId,
+      taskId: NodeId.make("controller-task"),
+      launchCommandId: CommandId.make("controller-launch"),
+    };
+    const layer = layerExecutorFor({
+      events,
+      multiAgentLaunch: (input) => {
+        assert.deepEqual(input, {
+          threadId,
+          coordinatorRunId: runId,
+          taskId: request.taskId,
+          launchCommandId: request.launchCommandId,
+        });
+        return Ref.update(events, (current) => [...current, "controlled-launch"]);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      yield* executor.execute({ ...restartEffect(now, { type: "detach" }), request });
+    }).pipe(Effect.provide(layer));
+    assert.deepEqual(yield* Ref.get(events), ["controlled-launch"]);
+  }),
+);
 
 it("does not retry pure interrupt races where the turn is already gone", () => {
   assert.isTrue(

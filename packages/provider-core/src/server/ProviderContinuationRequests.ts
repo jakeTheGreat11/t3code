@@ -1,5 +1,10 @@
 import {
   type OrchestrationV2Notification,
+  type ContinuationEmitterIdentity,
+  type ProviderInstanceId,
+  type ProviderSessionId,
+  ProviderInstanceGenerationId,
+  ProviderSessionGenerationId,
   MessageId,
   ProviderDriverKind,
   ProviderThreadId,
@@ -11,8 +16,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import { randomUuidV4 } from "./randomUuid.ts";
 
 export interface ProviderContinuationRequest {
+  /** Captured at runtime construction; omitted legacy identities remain explicitly unknown. */
+  readonly emitterIdentity?: ContinuationEmitterIdentity;
   readonly threadId: ThreadId;
   readonly providerThreadId: ProviderThreadId;
   readonly driver: ProviderDriverKind;
@@ -54,6 +62,44 @@ export interface ProviderContinuationRequest {
   readonly clearIfCurrent?: () => Effect.Effect<void>;
 }
 
+export function continuationEmitterIdentity(
+  request: Pick<ProviderContinuationRequest, "emitterIdentity">,
+): ContinuationEmitterIdentity {
+  return request.emitterIdentity ?? { type: "unknown", reason: "legacy_request" };
+}
+
+/** One factory per adapter generation, one binding per openSession construction attempt.
+ * The generation describes the T3 runtime wrapper, including its internal reconnects;
+ * it is not a claim about a provider-native subprocess or query generation.
+ */
+export const makeContinuationEmitter = Effect.fn("ProviderContinuationRequests.makeEmitter")(
+  function* (
+    providerInstanceId: ProviderInstanceId,
+    sink?: { readonly offer: (request: ProviderContinuationRequest) => Effect.Effect<void> },
+  ) {
+    const providerInstanceGenerationId = ProviderInstanceGenerationId.make(yield* randomUuidV4);
+    return {
+      forSession: Effect.fn("ProviderContinuationRequests.bindSession")(function* (
+        providerSessionId: ProviderSessionId,
+      ) {
+        const identity: ContinuationEmitterIdentity = Object.freeze({
+          type: "known",
+          providerInstanceId,
+          providerInstanceGenerationId,
+          providerSessionId,
+          providerSessionGenerationId: ProviderSessionGenerationId.make(yield* randomUuidV4),
+        });
+        return {
+          identity,
+          // Overwrite supplied metadata; only the captured construction identity is authoritative.
+          offer: (request: ProviderContinuationRequest) =>
+            sink?.offer({ ...request, emitterIdentity: identity }) ?? Effect.void,
+        };
+      }),
+    };
+  },
+);
+
 /**
  * Adapters offer a continuation request when provider-native work completes
  * outside an active turn (for example a Claude background task wake turn) so
@@ -75,7 +121,10 @@ export const layer = Layer.effect(
     const queue = yield* Queue.unbounded<ProviderContinuationRequest>();
     return {
       offer: (request: ProviderContinuationRequest) =>
-        Queue.offer(queue, request).pipe(Effect.asVoid),
+        Queue.offer(queue, {
+          ...request,
+          emitterIdentity: Object.freeze({ ...continuationEmitterIdentity(request) }),
+        }).pipe(Effect.asVoid),
       take: Queue.take(queue),
     };
   }),
